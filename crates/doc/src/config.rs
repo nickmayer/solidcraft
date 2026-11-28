@@ -163,8 +163,10 @@ impl Document {
 
     /// All folder ids in the subtrees rooted at `roots`, walking nested folders iteratively.
     pub fn timeline_group_subtree(&self, roots: &[u64]) -> BTreeSet<u64> {
+        let mut existing = BTreeSet::new();
         let mut children = BTreeMap::<u64, Vec<u64>>::new();
         for group in &self.timeline_groups {
+            existing.insert(group.id);
             if let Some(parent) = group.parent {
                 children.entry(parent).or_default().push(group.id);
             }
@@ -172,7 +174,7 @@ impl Document {
         let mut pending = roots.to_vec();
         let mut visited = BTreeSet::new();
         while let Some(id) = pending.pop() {
-            if !visited.insert(id) || self.timeline_group(id).is_none() {
+            if !existing.contains(&id) || !visited.insert(id) {
                 continue;
             }
             if let Some(kids) = children.get(&id) {
@@ -313,7 +315,11 @@ impl Document {
             Column::SuppressFolder(id) => {
                 let unique = self
                     .timeline_group(*id)
-                    .filter(|group| self.timeline_groups.iter().filter(|other| other.name == group.name).count() == 1)
+                    .filter(|group| {
+                        !group.name.is_empty()
+                            && group.name.parse::<u64>().is_err()
+                            && self.timeline_groups.iter().filter(|other| other.name == group.name).count() == 1
+                    })
                     .map(|group| group.name.as_str());
                 format!("suppress_folder:{}", unique.map(str::to_string).unwrap_or_else(|| id.to_string()))
             }
@@ -465,7 +471,10 @@ impl Document {
             None => None,
         };
         self.configs.columns.iter().zip(&r.cells).all(|(c, v)| match c {
-            Column::Suppress(id) => suppression_cell(v).is_ok_and(|on| self.feature(*id).is_some_and(|f| f.suppressed == on)),
+            Column::Suppress(id) => match expected.as_ref() {
+                Some(expected) => self.feature(*id).is_some_and(|f| expected.feature(*id).is_some_and(|exp| f.suppressed == exp.suppressed)),
+                None => suppression_cell(v).is_ok_and(|on| self.feature(*id).is_some_and(|f| f.suppressed == on)),
+            },
             Column::SuppressFolder(id) => expected.as_ref().is_some_and(|expected| self.folder_matches(expected, *id)),
             Column::Param(name) if self.text_param(name).is_some() => self.text_param(name).is_some_and(|p| p.text == crate::text_params::unquote(v)),
             Column::Param(name) => {
@@ -712,5 +721,37 @@ mod tests {
         d.remove_configuration_folders(&[g_parent]);
         assert_eq!(d.configs.columns, vec![col_override, col_empty]);
         assert!(d.configs.rows.iter().all(|r| r.cells.len() == 2));
+    }
+
+    #[test]
+    fn suppress_folder_numeric_names_missing_subtrees_and_feature_before_folder_order() {
+        let mut d = Document::new("FolderEdgeCases");
+        let f_inner = test_box(&mut d, "Inner");
+        let g_dup1 = d.allocate_id().unwrap();
+        let g_dup2 = d.allocate_id().unwrap();
+        let g_num = d.allocate_id().unwrap();
+        d.timeline_groups = vec![
+            crate::TimelineGroup { id: g_dup1, name: "Dup".into(), parent: None, features: vec![f_inner], joints: vec![] },
+            crate::TimelineGroup { id: g_dup2, name: "Dup".into(), parent: None, features: vec![], joints: vec![] },
+            crate::TimelineGroup { id: g_num, name: g_dup1.to_string(), parent: None, features: vec![], joints: vec![] },
+        ];
+        assert_eq!(d.config_key(&Column::SuppressFolder(g_dup1)), format!("suppress_folder:{g_dup1}"));
+        assert_eq!(d.config_key(&Column::SuppressFolder(g_dup2)), format!("suppress_folder:{g_dup2}"));
+        assert_eq!(d.config_key(&Column::SuppressFolder(g_num)), format!("suppress_folder:{g_num}"));
+        assert!(d.timeline_group_subtree(&[999_999]).is_empty());
+
+        // [Suppress(F), SuppressFolder(G)] with [false, true]: folder wins cleanly and configuration_matches stays true.
+        d.configs.columns = vec![Column::Suppress(f_inner), Column::SuppressFolder(g_dup1)];
+        d.configs.rows = vec![ConfigRow { id: 1, name: "FolderWins".into(), cells: vec!["false".into(), "true".into()] }];
+        d.apply_configuration("FolderWins").unwrap();
+        assert!(d.feature(f_inner).unwrap().suppressed);
+        assert!(d.configuration_matches());
+
+        // [SuppressFolder(G), Suppress(F)] with [true, false]: feature wins cleanly and configuration_matches stays true.
+        d.configs.columns = vec![Column::SuppressFolder(g_dup1), Column::Suppress(f_inner)];
+        d.configs.rows = vec![ConfigRow { id: 2, name: "FeatureWins".into(), cells: vec!["true".into(), "false".into()] }];
+        d.apply_configuration("FeatureWins").unwrap();
+        assert!(!d.feature(f_inner).unwrap().suppressed);
+        assert!(d.configuration_matches());
     }
 }

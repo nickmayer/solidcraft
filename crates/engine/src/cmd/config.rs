@@ -406,17 +406,17 @@ fn row(s: &mut Session, p: &Value) -> Result<Value> {
                 .configs
                 .columns
                 .iter()
-                .position(|c| {
-                    s.doc.config_key(c) == *k
-                        || match c {
-                            Column::Param(n) => n == k,
-                            Column::Suppress(id) => s.doc.feature(*id).is_some_and(|f| f.name == *k),
-                            Column::SuppressFolder(id) => s
-                                .doc
-                                .timeline_group(*id)
-                                .is_some_and(|g| g.name == *k && s.doc.timeline_groups.iter().filter(|other| other.name == g.name).count() == 1),
-                            Column::Material(_) | Column::Appearance(_) | Column::ComponentAppearance(_) | Column::FaceAppearance(_) => false,
-                        }
+                .position(|c| s.doc.config_key(c) == *k)
+                .or_else(|| {
+                    s.doc.configs.columns.iter().position(|c| match c {
+                        Column::Param(n) => n == k,
+                        Column::Suppress(id) => s.doc.feature(*id).is_some_and(|f| f.name == *k),
+                        Column::SuppressFolder(id) => s
+                            .doc
+                            .timeline_group(*id)
+                            .is_some_and(|g| g.name == *k && s.doc.timeline_groups.iter().filter(|other| other.name == g.name).count() == 1),
+                        Column::Material(_) | Column::Appearance(_) | Column::ComponentAppearance(_) | Column::FaceAppearance(_) => false,
+                    })
                 })
                 .ok_or_else(|| bad(cmd, format!("`{k}` is not a column (config.column adds one)")))?;
             match s.doc.configs.columns.get(col) {
@@ -743,21 +743,31 @@ fn not_captured(s: &Session) -> Vec<String> {
         _ => &s.saved,
     };
     let columns = &s.doc.configs.columns;
-    let mut captured_features = std::collections::BTreeSet::new();
+    let mut captured_feature_state = BTreeMap::new();
     for column in columns {
         match column {
             Column::Suppress(id) => {
-                captured_features.insert(*id);
+                if let Some(f) = s.doc.feature(*id) {
+                    captured_feature_state.insert(*id, f.suppressed);
+                }
             }
             Column::SuppressFolder(gid) => {
-                captured_features.extend(s.doc.timeline_group_contents(*gid).0);
+                if let Some(on) = s.doc.config_current(column).and_then(|v| v.parse::<bool>().ok()) {
+                    for fid in s.doc.timeline_group_contents(*gid).0 {
+                        captured_feature_state.insert(fid, on);
+                    }
+                }
             }
             _ => {}
         }
     }
     let mut out = Vec::new();
     for feature in &s.doc.features {
-        if !captured_features.contains(&feature.id) && baseline.feature(feature.id).is_some_and(|before| before.suppressed != feature.suppressed) {
+        let uncaptured = match captured_feature_state.get(&feature.id) {
+            Some(&captured) => captured != feature.suppressed,
+            None => baseline.feature(feature.id).is_some_and(|before| before.suppressed != feature.suppressed),
+        };
+        if uncaptured {
             out.push(format!("suppress:{}", feature.name));
         }
     }
@@ -1735,8 +1745,8 @@ mod tests {
         assert_eq!(table["targets"][0]["label"], "Suppress Folder: Chain");
         assert_eq!(table["rows"][0]["values"], json!({"suppress_folder:Chain": "false"}));
 
-        // Manually suppressing a feature inside the configured folder is captured by it
-        // (not reported in not_captured), while Base outside it is reported.
+        // Partially suppressing features inside the configured folder leaves a mixed state
+        // that is reported alongside unconfigured Base; suppressing the entire folder captures it.
         let base_id = s.doc.find_feature("Base").unwrap().id;
         let addon_id = s.doc.find_feature("Addon").unwrap().id;
         let extra_id = s.doc.find_feature("Extra").unwrap().id;
@@ -1744,9 +1754,15 @@ mod tests {
         assert!(!s.doc.configuration_matches());
         run(&mut s, "timeline.suppress", json!({"feature": base_id, "suppressed": true}));
         let updated = run(&mut s, "config.update_from_design", json!({"row": "Default"}));
-        assert_eq!(updated["not_captured"], json!(["suppress:Base"]));
+        assert_eq!(updated["not_captured"], json!(["suppress:Base", "suppress:Addon"]));
+        run(&mut s, "timeline.suppress", json!({"feature": extra_id, "suppressed": true}));
+        run(&mut s, "joint.edit", json!({"joint": joint, "suppressed": true}));
         run(&mut s, "timeline.suppress", json!({"feature": base_id, "suppressed": false}));
+        let updated = run(&mut s, "config.update_from_design", json!({"row": "Default"}));
+        assert_eq!(updated["not_captured"], json!(["suppress:Base"]));
         run(&mut s, "timeline.suppress", json!({"feature": addon_id, "suppressed": false}));
+        run(&mut s, "timeline.suppress", json!({"feature": extra_id, "suppressed": false}));
+        run(&mut s, "joint.edit", json!({"joint": joint, "suppressed": false}));
         run(&mut s, "config.update_from_design", json!({"row": "Default"}));
         assert!(s.doc.configuration_matches());
 
@@ -1846,5 +1862,34 @@ mod tests {
         run(&mut s, "timeline.delete", json!({"groups": [f2]}));
         assert!(s.doc.configs.columns.is_empty());
         assert!(s.doc.configs.rows.iter().all(|r| r.cells.is_empty()));
+    }
+
+    #[test]
+    fn suppress_folder_not_captured_reports_mixed_folder_members_and_respects_overrides() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "name": "Addon"}));
+        run(&mut s, "solid.box", json!({"corner": [20, 0, 0], "length": 10, "width": 10, "height": 10, "name": "Extra"}));
+        let group = run(&mut s, "timeline.group", json!({"name": "Bundle", "features": ["Addon", "Extra"]}))["group"].as_u64().unwrap();
+        run(&mut s, "config.configure", json!({"folders": [group]}));
+
+        // Suppressing only Addon creates a mixed state that the `false` folder cell cannot reproduce.
+        run(&mut s, "timeline.suppress", json!({"feature": "Addon", "suppressed": true}));
+        let res = run(&mut s, "config.update_from_design", json!({}));
+        assert_eq!(res["not_captured"], json!(["suppress:Addon"]));
+
+        // Uniform suppressed state omits both members.
+        run(&mut s, "timeline.suppress", json!({"feature": "Extra", "suppressed": true}));
+        let res = run(&mut s, "config.update_from_design", json!({}));
+        assert_eq!(res["not_captured"], json!([]));
+
+        // Unsuppressing Addon leaves Extra suppressed, so Extra cannot be reproduced by `false`.
+        run(&mut s, "timeline.suppress", json!({"feature": "Addon", "suppressed": false}));
+        let res = run(&mut s, "config.update_from_design", json!({}));
+        assert_eq!(res["not_captured"], json!(["suppress:Extra"]));
+
+        // Adding a trailing Suppress(Extra) override captures Extra alongside the folder column.
+        run(&mut s, "config.column", json!({"feature": "Extra"}));
+        let res = run(&mut s, "config.update_from_design", json!({}));
+        assert_eq!(res["not_captured"], json!([]));
     }
 }

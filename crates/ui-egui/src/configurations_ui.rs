@@ -4,6 +4,14 @@ use crate::ui_kit::BackingTooltipExt as _;
 use crate::{SolveApp, ui_kit};
 use serde_json::{Value, json};
 use solidcraft_engine::doc::DEFAULT_MATERIAL;
+fn folder_name_counts(app: &SolveApp) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for group in &app.session.doc.timeline_groups {
+        *counts.entry(group.name.as_str()).or_default() += 1;
+    }
+    counts
+}
+
 /// The Configurations table, its rules and errors.
 pub(super) fn configurations_rows(
     app: &mut SolveApp,
@@ -27,6 +35,7 @@ pub(super) fn configurations_rows(
     let run = |app: &mut SolveApp, error: &mut Option<String>, id: &str, p: Value| {
         *error = app.run(id, p).err();
     };
+    let folder_counts = folder_name_counts(app);
     let labels: Vec<_> = std::iter::once(solidcraft_ui_text::tr_label("Configuration").to_owned())
         .chain(tb.columns.iter().map(|c| {
             let (kind, name) = column_parts(c);
@@ -41,7 +50,7 @@ pub(super) fn configurations_rows(
                     "appearance" => format!("{}: {name}", solidcraft_ui_text::tr_label("Appearance")),
                     "suppress" => format!("{}: {name}", solidcraft_ui_text::tr_label("Suppress")),
                     "suppress_folder" => {
-                        let folder_name = app
+                        let folder_label = app
                             .session
                             .doc
                             .configs
@@ -52,19 +61,24 @@ pub(super) fn configurations_rows(
                                     && app.session.doc.config_key(column) == *c
                             })
                             .and_then(|column| match column {
-                                solidcraft_engine::doc::config::Column::SuppressFolder(id) => {
-                                    app.session.doc.timeline_group(*id).map(|g| g.name.as_str())
-                                }
+                                solidcraft_engine::doc::config::Column::SuppressFolder(id) => app.session.doc.timeline_group(*id).map(|g| {
+                                    if folder_counts.get(g.name.as_str()).copied().unwrap_or(0) > 1 {
+                                        format!("{} (#{id})", g.name)
+                                    } else {
+                                        g.name.clone()
+                                    }
+                                }),
                                 _ => None,
                             })
-                            .unwrap_or(name);
-                        solidcraft_ui_text::format("config.suppress_folder", &[("name", folder_name)])
+                            .unwrap_or_else(|| name.to_owned());
+                        solidcraft_ui_text::format("config.suppress_folder", &[("name", &folder_label)])
                     }
                     _ => name.to_owned(),
                 })
         }))
         .chain(std::iter::once(solidcraft_ui_text::tr_label("Actions").to_owned()))
         .collect();
+    drop(folder_counts);
     let gap = ui.spacing().item_spacing.x;
     let name_width = tb.rows.iter().map(|(name, _)| ui_kit::ContentWidth::name(ui, name)).fold(0.0, f32::max);
     let status_width = (ui_kit::ContentWidth::label(ui, "Active")
@@ -508,15 +522,17 @@ fn column_menu(
             options.push((format!("Suppress {}", f.name), json!({ "feature": f.name })));
         }
     }
+    let folder_counts = folder_name_counts(app);
     for group in &app.session.doc.timeline_groups {
         let key = app.session.doc.config_key(&solidcraft_engine::doc::config::Column::SuppressFolder(group.id));
         if !columns.contains(&key) {
             let base = solidcraft_ui_text::format("config.add_suppress_folder", &[("name", &group.name)]);
-            let duplicate = app.session.doc.timeline_groups.iter().filter(|other| other.name == group.name).count() > 1;
+            let duplicate = folder_counts.get(group.name.as_str()).copied().unwrap_or(0) > 1;
             let label = if duplicate { format!("{base} (#{})", group.id) } else { base };
             options.push((label, json!({ "folder": group.id })));
         }
     }
+    drop(folder_counts);
     for body in &app.session.model.state().bodies {
         for kind in ["material", "appearance"] {
             if !columns.contains(&format!("{kind}:{}", body.name)) {

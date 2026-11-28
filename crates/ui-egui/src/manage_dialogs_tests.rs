@@ -1346,3 +1346,18 @@ fn configuration_folder_suppression_columns_add_toggle_activate_and_remove() {
     h.frames(4);
     assert_eq!(h.app.session.doc.configs.columns, vec![solidcraft_engine::doc::config::Column::Param("width".into())]);
 }
+
+#[test]
+fn configuration_duplicate_folder_headers_include_ids() {
+    let mut h = fixture();
+    h.app.run("solid.box", json!({"corner":[20,0,0],"length":10,"width":10,"height":10,"name":"B1"})).unwrap();
+    h.app.run("solid.box", json!({"corner":[40,0,0],"length":10,"width":10,"height":10,"name":"B2"})).unwrap();
+    let f1 = h.app.run("timeline.group", json!({"name":"Shared","features":["B1"]})).unwrap()["group"].as_u64().unwrap();
+    let f2 = h.app.run("timeline.group", json!({"name":"Shared","features":["B2"]})).unwrap()["group"].as_u64().unwrap();
+    h.app.run("config.configure", json!({"folders":[f1, f2]})).unwrap();
+    h.app.start("config.table");
+    h.frames(4);
+
+    assert!(scenario::rect_of(&format!("dialog:column:configuration_table:Suppress Folder: Shared (#{f1})")).is_some());
+    assert!(scenario::rect_of(&format!("dialog:column:configuration_table:Suppress Folder: Shared (#{f2})")).is_some());
+}
