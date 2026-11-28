@@ -1506,7 +1506,7 @@ fn ground(s: &mut Session, p: &Value) -> Result<Value> {
     // Even a repeated grounded:false request must report existing joint issues. Use the normal
     // refresh loop so features that read a changed placement are evaluated before the reply.
     s.joints_settled = None;
-    let solved = s.refresh_with_joint_report().unwrap_or_default();
+    let solved = s.refresh_with_joint_report(true).unwrap_or_default();
     let moved = super::motion::moved(&before, &super::motion::positions(s)).map(|(name, _)| name.clone()).collect();
     let transform = s.doc.occurrences.iter().find(|o| o.id == id).ok_or_else(|| bad(cmd, "occurrence"))?.transform;
     reply(GroundResult {

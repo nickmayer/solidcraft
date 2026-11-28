@@ -2462,7 +2462,7 @@ impl Session {
     pub fn refresh(&mut self) {
         self.sketch_finish_pending = false;
         let token_current = self.design_token_is_current();
-        let _ = self.refresh_with_joint_report();
+        let _ = self.refresh_with_joint_report(false);
         if token_current {
             self.follow_design_token();
         }
@@ -2630,7 +2630,7 @@ impl Session {
     }
 
     /// Refresh normally, retaining the last joint solve for commands that report its outcome.
-    fn refresh_with_joint_report(&mut self) -> Option<solidcraft_doc::joints::Solution> {
+    fn refresh_with_joint_report(&mut self, want_joint_report: bool) -> Option<solidcraft_doc::joints::Solution> {
         let mut solved = None;
         self.model.set_background_checks(self.background_checks && !self.is_copy);
         let evaluated = self.model.evaluate_shared(&self.doc);
@@ -2677,17 +2677,23 @@ impl Session {
             // A solve that moves parts changes what features reading where a part is placed
             // (a mirror of a placed body) make: the model is evaluated again for the placements
             // the design now holds, and the joints solved for that model, a few times at most.
+            let mut evaluated_after_solve = false;
             for _ in 0..3 {
                 let before = self.doc.clone();
                 if let Some(solution) = self.solve_joints() {
                     solved = Some(solution);
                 }
                 if Arc::ptr_eq(&before, &self.doc) || before.occurrences == self.doc.occurrences {
+                    evaluated_after_solve = false;
                     break;
                 }
                 self.model.evaluate(&self.doc);
                 self.evaluations = self.evaluations.saturating_add(1);
                 self.sync_capture_position_state();
+                evaluated_after_solve = true;
+            }
+            if want_joint_report && evaluated_after_solve {
+                solved = Some(solidcraft_doc::joints::solve(&self.doc, &self.model.state()));
             }
         }
         cmd::motion::associative::refresh(self);
@@ -3194,7 +3200,7 @@ impl Session {
         }
         self.sketch_finish_pending = false;
         let token_current = self.design_token_is_current();
-        let solved = self.refresh_with_joint_report();
+        let solved = self.refresh_with_joint_report(true);
         if token_current {
             self.follow_design_token();
         }

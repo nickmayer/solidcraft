@@ -177,7 +177,13 @@ fn column_of(s: &Session, p: &Value, cmd: &str) -> Result<Column> {
             .ok_or_else(|| bad(cmd, "`joint` must be an id or a name"))?;
         if bool_(p, "delete") == Some(true)
             && let Some(column) = s.doc.configs.columns.iter().find(|column| {
-                matches!(column, Column::SuppressJoint(id) if id.to_string() == key || s.doc.config_key(column) == key || s.doc.joint(*id).is_some_and(|j| j.name == key))
+                matches!(
+                    column,
+                    Column::SuppressJoint(id)
+                        if id.to_string() == key
+                            || (!value.is_number()
+                                && (s.doc.config_key(column) == key || s.doc.joint(*id).is_some_and(|j| j.name == key)))
+                )
             })
         {
             return Ok(column.clone());
@@ -400,14 +406,14 @@ fn row(s: &mut Session, p: &Value) -> Result<Value> {
                 .configs
                 .columns
                 .iter()
-                .position(|c| {
-                    s.doc.config_key(c) == *k
-                        || match c {
-                            Column::Param(n) => n == k,
-                            Column::Suppress(id) => s.doc.feature(*id).is_some_and(|f| f.name == *k),
-                            Column::SuppressJoint(id) => *k == format!("suppress_joint:{id}") || s.doc.joint(*id).is_some_and(|j| j.name == *k),
-                            Column::Material(_) | Column::Appearance(_) | Column::ComponentAppearance(_) | Column::FaceAppearance(_) => false,
-                        }
+                .position(|c| s.doc.config_key(c) == *k)
+                .or_else(|| {
+                    s.doc.configs.columns.iter().position(|c| match c {
+                        Column::Param(n) => n == k,
+                        Column::Suppress(id) => s.doc.feature(*id).is_some_and(|f| f.name == *k),
+                        Column::SuppressJoint(id) => *k == format!("suppress_joint:{id}") || s.doc.joint(*id).is_some_and(|j| j.name == *k),
+                        Column::Material(_) | Column::Appearance(_) | Column::ComponentAppearance(_) | Column::FaceAppearance(_) => false,
+                    })
                 })
                 .ok_or_else(|| bad(cmd, format!("`{k}` is not a column (config.column adds one)")))?;
             match s.doc.configs.columns.get(col) {
@@ -1915,5 +1921,37 @@ mod tests {
         run(&mut s, "component.delete", json!({"component": "Arm"}));
         assert!(s.doc.configs.columns.is_empty());
         assert!(s.doc.configs.rows.iter().all(|r| r.cells.is_empty()));
+    }
+
+    #[test]
+    fn suppress_joint_numeric_name_column_delete_row_edit_and_script_export() {
+        let (mut s, _) = hinged_arm_session();
+        let hinge_id = s.doc.assembly.joints[0].id;
+        let angle_id = s.doc.assembly.joints[1].id;
+        run(&mut s, "joint.edit", json!({"joint": hinge_id, "name": angle_id.to_string()}));
+        run(&mut s, "config.configure", json!({"joints": [hinge_id, angle_id]}));
+
+        // `hinge_id` has numeric name `angle_id.to_string()`, so `config_key` falls back to its id (`suppress_joint:{hinge_id}`).
+        assert_eq!(s.doc.config_key(&s.doc.configs.columns[0]), format!("suppress_joint:{hinge_id}"));
+        assert_eq!(s.doc.config_key(&s.doc.configs.columns[1]), "suppress_joint:FixedAngle");
+
+        // Numeric `{"joint": angle_id, "delete": true}` must delete `angle_id`, not `hinge_id` named `"{angle_id}"`.
+        run(&mut s, "config.column", json!({"joint": angle_id, "delete": true}));
+        assert_eq!(s.doc.configs.columns, vec![solidcraft_doc::config::Column::SuppressJoint(hinge_id)]);
+
+        // Script export must refuse `hinge_id` because its name equals another joint's id / is numeric.
+        let err = s.execute("timeline.export_script", &json!({})).unwrap_err().to_string();
+        assert!(err.contains("joint"), "{err}");
+
+        // Canonical key still resolves `hinge_id` when another joint's column follows.
+        run(&mut s, "joint.edit", json!({"joint": hinge_id, "name": "Clamp"}));
+        run(&mut s, "config.column", json!({"joint": angle_id}));
+        run(
+            &mut s,
+            "config.row",
+            json!({"name": "Check", "values": {format!("suppress_joint:{hinge_id}"): true, "suppress_joint:FixedAngle": false}}),
+        );
+        let row = s.doc.configs.rows.iter().find(|r| r.name == "Check").unwrap();
+        assert_eq!(row.cells, vec!["true", "false"]);
     }
 }

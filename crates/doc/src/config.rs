@@ -252,7 +252,11 @@ impl Document {
             Column::SuppressJoint(id) => {
                 let key = self
                     .joint(*id)
-                    .filter(|j| self.assembly.joints.iter().filter(|other| other.name == j.name).count() == 1)
+                    .filter(|j| {
+                        !j.name.is_empty()
+                            && j.name.parse::<u64>().is_err()
+                            && self.assembly.joints.iter().filter(|other| other.name == j.name).count() == 1
+                    })
                     .map_or_else(|| id.to_string(), |j| j.name.clone());
                 format!("suppress_joint:{key}")
             }
@@ -589,5 +593,16 @@ mod tests {
         let before = d.clone();
         assert!(d.apply_configuration("Fixed").is_err());
         assert_eq!(d, before);
+    }
+
+    #[test]
+    fn suppress_joint_numeric_name_uses_id_key_and_avoids_collisions() {
+        let mut d = Document::new("JointNumericKeys");
+        d.assembly.joints.push(test_joint(10, "Dup", false));
+        d.assembly.joints.push(test_joint(11, "Dup", false));
+        d.assembly.joints.push(test_joint(12, "10", false));
+        assert_eq!(d.config_key(&Column::SuppressJoint(10)), "suppress_joint:10");
+        assert_eq!(d.config_key(&Column::SuppressJoint(11)), "suppress_joint:11");
+        assert_eq!(d.config_key(&Column::SuppressJoint(12)), "suppress_joint:12");
     }
 }

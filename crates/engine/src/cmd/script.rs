@@ -815,7 +815,12 @@ fn config_steps(doc: &Document, has_body: &dyn Fn(&str) -> bool, omitted: &mut V
                 json!({"feature": name.ok_or("a suppression column whose feature a name does not pick out")?})
             }
             Column::SuppressJoint(id) => {
-                let name = doc.joint(*id).map(|j| j.name.as_str()).filter(|n| doc.assembly.joints.iter().filter(|j| j.name == *n).count() == 1);
+                let name = doc.joint(*id).map(|j| j.name.as_str()).filter(|n| {
+                    !n.is_empty() && n.parse::<u64>().is_err() && {
+                        let mut matches = doc.assembly.joints.iter().filter(|j| j.id.to_string() == *n || j.name == *n);
+                        matches.next().is_some_and(|j| j.id == *id) && matches.next().is_none()
+                    }
+                });
                 json!({"joint": name.ok_or("a joint suppression column whose joint a name does not pick out")?})
             }
             // `config.column` finds the body in the design as the replay has built it by then. A
