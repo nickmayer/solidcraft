@@ -94,9 +94,11 @@ pub use cmd::find_command;
 pub use cmd::motion::AutomaticExplode;
 pub use cmd::normalize_command_id;
 pub use cmd::resolve_design_links;
+pub use cmd::scan_align::preview_align as preview_scan_align;
 pub use cmd::settings::MAX_PROFILE_NAME;
 pub use cmd::settings::profile_name;
 pub use cmd::shown_scope;
+pub use cmd::shown_scope_for;
 pub use cmd::sketch_selection;
 pub use cmd::standard_view;
 pub use cmd::use_import_cache_dir;
@@ -546,6 +548,8 @@ pub struct Snapshot {
     pub sketching_view: Option<u64>,
     /// Temporary editor position to finalize if its former view has since closed.
     pub sketch_restore_marker: Option<Option<usize>>,
+    /// Where Cancel returns when history reopens the model sketch.
+    pub(crate) sketch_entry: Option<SketchEntry>,
     /// Explicitly owned sheet edit, independent of the model sketch being edited.
     pub active_sheet_sketch: Option<Arc<SheetSketchEdit>>,
     pub pending_moves: std::collections::BTreeMap<u64, solidcraft_doc::Mat>,
@@ -573,6 +577,7 @@ impl Snapshot {
             active_sketch: s.active_sketch,
             sketching_view: s.sketching_view,
             sketch_restore_marker: s.sketch_restore_marker(),
+            sketch_entry: s.sketch_entry.clone(),
             active_sheet_sketch: s.active_sheet_sketch.clone(),
             pending_moves: s.pending_moves.clone(),
             pending_move_records: s.pending_move_records.clone(),
@@ -592,6 +597,7 @@ impl Snapshot {
             active_sketch: None,
             sketching_view: None,
             sketch_restore_marker: None,
+            sketch_entry: None,
             active_sheet_sketch: None,
             pending_moves: Default::default(),
             pending_move_records: Vec::new(),
@@ -630,7 +636,7 @@ pub struct DragPreview {
 
 /// Where the open sketch was entered (`sketch.create`, `sketch.edit`): the design before it and
 /// the undo history then, so `sketch.cancel` can tell the entry still describes the history.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SketchEntry {
     pub(crate) sketch: u64,
     pub(crate) doc: Arc<Document>,
@@ -3131,6 +3137,12 @@ impl Session {
         self.visibility_revision += 1;
     }
 
+    /// Revision of the document and its evaluated model within this session. Selecting or
+    /// hiding an item redraws the view without changing either input.
+    pub fn model_revision(&self) -> u64 {
+        self.revision.wrapping_sub(self.visibility_revision)
+    }
+
     /// Show the sketch a live frame changed, leaving the features after it as they were last
     /// evaluated (marked stale); a full `refresh` when the model cannot show it that way.
     fn refresh_live(&mut self, edit: LiveEdit) {
@@ -3438,6 +3450,10 @@ impl Session {
             }),
             ..Snapshot::of(self, spec.label)
         };
+        // The closed save writers rename history in place, without changing its steps.
+        // Retain only their lengths: pinning every old document would force copies on Save As.
+        let sketch_save_history_len =
+            (before.sketch_entry.is_some() && matches!(spec.id, "file.save" | "file.save_as")).then_some((self.undo.len(), self.redo.len()));
         let link_read_before = (spec.id == "component.relink").then(|| before.doc.clone());
         let link_observations_before = self.plugin_state.link_changes.clone();
         let link_reads_before = self.plugin_state.link_reads.clone();
@@ -3658,6 +3674,37 @@ impl Session {
                 Ok(v)
             }
             Err(e) => {
+                // A returned save error has already renamed the history back. Keep its coherent
+                // entry bindings while restoring every other entry field below. Unproven failure
+                // paths (including a panic before rename-back) use the ordinary rollback.
+                let saved_sketch_binding = sketch_save_history_len.and_then(|(undo_len, redo_len)| {
+                    let entry = self.sketch_entry.as_ref()?;
+                    let original = before.sketch_entry.as_ref()?;
+                    let top = entry.undo_len.checked_sub(1).and_then(|i| self.undo.get(i));
+                    let anchored = match (top, &entry.undo_top) {
+                        (Some(step), Some(doc)) => Arc::ptr_eq(&step.doc, doc),
+                        (None, None) => entry.undo_len == 0,
+                        _ => false,
+                    };
+                    (self.undo.len() == undo_len
+                        && self.redo.len() == redo_len
+                        && self.active_sketch == before.active_sketch
+                        && self.sketching_view == before.sketching_view
+                        && self.doc.name == before.doc.name
+                        && self.doc.as_ref() == before.doc.as_ref()
+                        && entry.sketch == original.sketch
+                        && entry.undo_len == original.undo_len
+                        && entry.restore_marker == original.restore_marker
+                        && entry.pending_moves == original.pending_moves
+                        && entry.pending_move_records == original.pending_move_records
+                        && entry.pending_joint_bases == original.pending_joint_bases
+                        && entry.last_capture_state == original.last_capture_state
+                        && entry.visibility == original.visibility
+                        && entry.doc.as_ref() == original.doc.as_ref()
+                        && entry.undo_top.as_deref() == original.undo_top.as_deref()
+                        && anchored)
+                        .then(|| (entry.doc.clone(), entry.undo_top.clone()))
+                });
                 // A failed command draws no ids, so a replay of what succeeded draws the same.
                 self.ids = ids;
                 self.plugin_state.link_changes = link_observations_before;
@@ -3670,6 +3717,11 @@ impl Session {
                 self.active_sheet_sketch = before.active_sheet_sketch.clone();
                 self.active_sketch = before.active_sketch;
                 self.sketching_view = before.sketching_view;
+                self.sketch_entry.clone_from(&before.sketch_entry);
+                if let (Some(entry), Some((doc, undo_top))) = (self.sketch_entry.as_mut(), saved_sketch_binding) {
+                    entry.doc = doc;
+                    entry.undo_top = undo_top;
+                }
                 if let Some(section) = before.section.take() {
                     self.set_section_state(section);
                 }
@@ -4041,15 +4093,25 @@ impl Session {
     /// `marker` restores an editor's original marker before recording its undo snapshot.
     /// The source remains untouched, including its history and recovery journal.
     pub fn compute_commands(self, commands: &[(String, Value)], marker: Option<Option<usize>>) -> Result<ComputedCommands> {
-        self.compute_commands_inner(commands, marker, None)
+        self.compute_commands_inner(commands, marker, None, None)
     }
 
     /// Start an edit from its pinned original model, so restoring the original marker cannot
     /// recompute the obsolete suffix even when previews have evicted its evaluation cache.
+    ///
+    /// The design may have gained a parameter while the editor was open (#9223): the edit the
+    /// user is making may use the parameter just added, and no feature that was already built
+    /// reads it, so the editor's model still describes the design. The edit is then computed on
+    /// the design as it is now, and the parameter it uses is there. Every other change leaves
+    /// the editor stale, and the edit is refused.
     pub fn compute_editor_commands(self, commands: &[(String, Value)], source: &Session, original: Session) -> Result<ComputedCommands> {
-        if !self.same_document_context(source) {
+        let base = if self.same_document_context(source) {
+            None
+        } else if self.same_editor_context_with_gained_parameters(source) {
+            Some(self.editor_base(&original))
+        } else {
             return Err(EngineError::Other("the design changed while the feature editor was open".into()));
-        }
+        };
         let mut expected = (*original.doc).clone();
         // The temporary rollback is another revision of the same model inputs.
         expected.marker = source.doc.marker;
@@ -4089,7 +4151,7 @@ impl Session {
         if expected != *source.doc {
             return Err(EngineError::Other("the original editor model does not match its source design".into()));
         }
-        self.compute_commands_inner(commands, Some(original.doc.marker), Some(original))
+        self.compute_commands_inner(commands, Some(original.doc.marker), Some(original), base)
     }
 
     fn compute_commands_inner(
@@ -4097,9 +4159,10 @@ impl Session {
         commands: &[(String, Value)],
         marker: Option<Option<usize>>,
         original: Option<Session>,
+        base: Option<Session>,
     ) -> Result<ComputedCommands> {
         let stop = self.stop.clone();
-        stop.within(|| self.compute_commands_under(commands, marker, original))
+        stop.within(|| self.compute_commands_under(commands, marker, original, base))
     }
 
     fn compute_commands_under(
@@ -4107,6 +4170,7 @@ impl Session {
         commands: &[(String, Value)],
         marker: Option<Option<usize>>,
         original: Option<Session>,
+        base: Option<Session>,
     ) -> Result<ComputedCommands> {
         let editor_original = original.as_ref().map(|session| session.doc.clone());
         let mut computed = self.scratch();
@@ -4119,11 +4183,14 @@ impl Session {
             let before = computed.doc.clone();
             let params = marker.map(|position| serde_json::json!({"position":position})).unwrap_or_else(|| serde_json::json!({}));
             let reply = if let Some(original) = original {
-                computed.doc = original.doc;
-                computed.model = original.model;
-                computed.world_cache = original.world_cache;
-                computed.pending_joint_bases = original.pending_joint_bases;
-                computed.last_capture_state = original.last_capture_state;
+                // The editor's own model, or the design as it is now when it gained a parameter
+                // while the editor was open (#9223).
+                let base = base.unwrap_or(original);
+                computed.doc = base.doc;
+                computed.model = base.model;
+                computed.world_cache = base.world_cache;
+                computed.pending_joint_bases = base.pending_joint_bases;
+                computed.last_capture_state = base.last_capture_state;
                 serde_json::json!({"marker":marker.unwrap_or(computed.doc.features.len()),"features":computed.doc.features.len()})
             } else {
                 let undo = std::mem::take(&mut computed.undo);
@@ -4266,13 +4333,73 @@ impl Session {
             && self.pending_joint_bases == source.pending_joint_bases
     }
 
+    /// The editor's context is the one it was opened in, and the design only gained parameters
+    /// since (#9223): the parameters the user added are part of the edit the editor is making,
+    /// and no feature that was already built reads them, so the editor's model still describes
+    /// the design. Every other change leaves the editor stale.
+    fn same_editor_context_with_gained_parameters(&self, source: &Session) -> bool {
+        self.document_id == source.document_id
+            && self.ids.seed() == source.ids.seed()
+            && self.active_sketch == source.active_sketch
+            && self.sketching_view == source.sketching_view
+            && self.active_sheet_sketch == source.active_sheet_sketch
+            && self.open_drawing == source.open_drawing
+            && self.active_component == source.active_component
+            && self.active_occurrence_path == source.active_occurrence_path
+            && self.pending_moves == source.pending_moves
+            && self.pending_move_records == source.pending_move_records
+            && self.pending_joint_bases == source.pending_joint_bases
+            && self
+                .revision
+                .checked_sub(source.revision)
+                .is_some_and(|delta| self.visibility_revision.checked_sub(source.visibility_revision).is_some_and(|shown| delta >= shown))
+            && self.design_gained_only_parameters(source)
+    }
+
+    /// The design is the one the editor was opened on, plus the parameters it gained: the
+    /// parameters it gained are the last ones, and nothing else about it moved.
+    fn design_gained_only_parameters(&self, source: &Session) -> bool {
+        let gained = &self.doc.params;
+        let pinned = &source.doc.params;
+        if gained.len() <= pinned.len() || !gained.starts_with(pinned) {
+            return false;
+        }
+        let mut design = (*self.doc).clone();
+        design.params = pinned.clone();
+        design == *source.doc
+    }
+
+    /// The design the editor's edit is computed on when the design gained a parameter while
+    /// the editor was open (#9223): the design as it was when the editor was opened, with the
+    /// parameters it gained since. The parameters are not part of the edit, and no feature that
+    /// was already built reads them, so the editor's model and its capture state describe the
+    /// design this is.
+    fn editor_base(&self, original: &Session) -> Session {
+        let mut base = original.scratch();
+        let mut design = (*original.doc).clone();
+        design.params = self.doc.params.clone();
+        base.doc = Arc::new(design);
+        base
+    }
+
     /// Cancel an unchanged feature editor by restoring its original evaluated model, even
     /// after preview work has evicted the old suffix from the shared evaluation cache.
+    ///
+    /// The design may have gained a parameter while the editor was open (#9223): the parameter
+    /// is not part of the edit being cancelled, so it stays, and the design is put back the way
+    /// it was with it. Every other change leaves the editor stale, and the cancel is refused.
     pub fn restore_editor(&mut self, source: &Session, mut original: Session) -> Result<()> {
         self.checked_sketch_owner(original.active_sketch, original.sketching_view)?;
         self.checked_sheet_sketch_owner(&self.view_context, original.active_sheet_sketch.as_deref(), &original.doc)?;
         if !self.same_document_context(source) {
-            return Err(EngineError::Other("the design changed while the feature editor was open; its current timeline was preserved".into()));
+            if !self.same_editor_context_with_gained_parameters(source) {
+                return Err(EngineError::Other("the design changed while the feature editor was open; its current timeline was preserved".into()));
+            }
+            // The parameters the design gained are not part of the edit being cancelled: they
+            // stay with the design it is put back to (#9223).
+            let mut design = (*original.doc).clone();
+            design.params = self.doc.params.clone();
+            original.doc = Arc::new(design);
         }
         let params = original.doc.marker.map(|position| serde_json::json!({"position":position})).unwrap_or_else(|| serde_json::json!({}));
         crash::accepted_command(self, &self.doc, &original.doc, "timeline.roll_to", &params, !Arc::ptr_eq(&self.doc, &original.doc));
@@ -4302,9 +4429,19 @@ impl Session {
     /// Hide/show steps taken in an editor belong to the complete design, not its temporary
     /// rollback. Keep each step's visibility and ordering, on both sides of the history.
     fn restore_editor_history(&mut self, source: &Arc<Document>, original: &Arc<Document>) {
+        // The editor's rolled-back design, without the parameters the design gained since
+        // (#9223): a step taken while the editor was open holds it.
+        let pinned = source.params.len().min(original.params.len());
+        let rolled = if source.params.len() > pinned {
+            let mut design = (**source).clone();
+            design.params.truncate(pinned);
+            Arc::new(design)
+        } else {
+            source.clone()
+        };
         for snapshot in self.undo.iter_mut().chain(&mut self.redo) {
-            if Arc::ptr_eq(&snapshot.doc, source) {
-                snapshot.doc = original.clone();
+            if is_editor_rollback(&snapshot.doc, &rolled) {
+                snapshot.doc = restored_editor_document(original, &snapshot.doc);
             }
         }
     }
@@ -4604,7 +4741,8 @@ impl Session {
         Ok((self, replies))
     }
 
-    /// Measure one or two selections (see `inspect.measure` with `items`); errors come back as
+    /// Measure one or two selections, or three or more round ones for their spacing (see
+    /// `inspect.measure` with `items`); errors come back as
     /// `{"error": …}`.
     pub fn measure_items(&self, items: &[Sel]) -> Value {
         let v = serde_json::to_value(items).unwrap_or(Value::Null);
@@ -4922,6 +5060,37 @@ fn design_revision_generation(token: &str) -> Option<(&str, u64)> {
     Some((epoch, generation.parse().ok()?))
 }
 
+/// Whether the design is the editor's rolled-back one: the design as it was when the editor was
+/// opened, with the parameters the design gained since (#9223). Such a step belongs to the
+/// complete design, not to the editor's temporary rollback.
+fn is_editor_rollback(document: &Arc<Document>, rolled: &Arc<Document>) -> bool {
+    if Arc::ptr_eq(document, rolled) {
+        return true;
+    }
+    if !document.params.starts_with(&rolled.params) {
+        return false;
+    }
+    if document.params.len() == rolled.params.len() {
+        return **document == **rolled;
+    }
+    let mut design = (**document).clone();
+    design.params.truncate(rolled.params.len());
+    design == **rolled
+}
+
+/// The design a step of the editor's history is restored to: the design as it was when the
+/// editor was opened, with the parameters the step's own document had. The parameters the
+/// design gained are not part of the editor's edit, so a step taken after they were added keeps
+/// them (#9223).
+fn restored_editor_document(original: &Arc<Document>, step: &Arc<Document>) -> Arc<Document> {
+    if step.params == original.params {
+        return original.clone();
+    }
+    let mut design = (**original).clone();
+    design.params = step.params.clone();
+    Arc::new(design)
+}
+
 /// Whether two designs differ at most in their features. Every field is named, so a new one has
 /// to be decided on here.
 fn same_but_features(a: &Document, b: &Document) -> bool {
@@ -4971,6 +5140,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         drawings,
         next_component_color_index,
         plane_extents,
+        view_frame,
         plugin_data,
         linked_bodies_left_out,
     } = a;
@@ -5019,6 +5189,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *drawings == b.drawings
         && *next_component_color_index == b.next_component_color_index
         && *plane_extents == b.plane_extents
+        && *view_frame == b.view_frame
 }
 
 /// Store `pins` (sketch, link, vertex name, edge name) on the links they name: a name the link

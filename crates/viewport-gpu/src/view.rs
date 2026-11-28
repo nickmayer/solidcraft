@@ -1827,7 +1827,7 @@ impl SharedGpu {
     fn new(device: &wgpu::Device, tris: &SharedTris) -> Option<SharedGpu> {
         let limit = device.limits().max_buffer_size;
         let index_bytes = (tris.indices.len() * 4) as u64;
-        if tris.vertices.is_empty() || tris.indices.is_empty() {
+        if tris.vertices.is_empty() || tris.indices.is_empty() || upload_refused() {
             return None;
         }
         if tris.vertices.len() as u64 > limit || index_bytes > limit {
@@ -2139,7 +2139,7 @@ fn class_gpu(
     same_vertices: bool,
     uploaded: &mut u64,
 ) -> Option<ClassGpu> {
-    if runs.is_empty() {
+    if runs.is_empty() || upload_refused() {
         return None;
     }
     let same_runs = old.is_some_and(|(_, old_runs)| Arc::ptr_eq(old_runs, runs));
@@ -2518,8 +2518,10 @@ struct GlassSource {
 #[derive(Default, Clone)]
 struct Batches {
     projection: Option<Arc<ground_shadow::Projection>>,
-    /// The last scene upload failed (and was logged): a retry that fails again is not.
-    upload_failed: bool,
+    /// The scene key whose last upload was refused by the device, and why: the same key is not
+    /// retried on every repaint frame (preventing a tight-loop GPU OOM storm), and a later failure
+    /// is not logged again until an upload succeeds.
+    failed_upload: Option<(u64, String)>,
     /// What the last scene taken uploaded.
     uploads: UploadStats,
     /// The blocks' see-through triangles the global glass stream was assembled from (block key,
@@ -2614,8 +2616,9 @@ impl Batches {
     /// Upload a new scene. Planned bodies not yet on the GPU are evaluated there: their
     /// dispatches go into `encoder`, ahead of this frame's render pass. The new scene is built
     /// into a copy and swapped in only when every buffer uploaded: when the device refuses one
-    /// (out of memory), the previous picture stays, the scene is put back to be retried (unless
-    /// a newer one was published meanwhile), the failure is logged once, and the reason returned.
+    /// (out of memory), the previous picture stays, the scene is put back (unless a newer one was
+    /// published meanwhile), the same failing key is not retried on every repaint frame, the
+    /// failure is logged once, and the reason returned.
     fn take(
         &mut self,
         device: &wgpu::Device,
@@ -2652,6 +2655,11 @@ impl Batches {
         if self.key == Some(key) {
             return Ok(());
         }
+        if let Some((failed_key, reason)) = &self.failed_upload
+            && *failed_key == key
+        {
+            return Err(reason.clone());
+        }
         let Some(sc) = slot.lock().ok().and_then(|mut s| s.take()) else { return Ok(()) };
         let _ = take_upload_failure();
         let mut next = self.clone();
@@ -2659,7 +2667,7 @@ impl Batches {
         next.upload_scene(device, queue, uniform, bgl, key, &sc, tess, oit_available, taken.as_mut(), model);
         match take_upload_failure() {
             None => {
-                next.upload_failed = false;
+                next.failed_upload = None;
                 *self = next;
                 if let (Some(d), Some(t)) = (donor, taken) {
                     *d = t;
@@ -2667,10 +2675,10 @@ impl Batches {
                 Ok(())
             }
             Some(reason) => {
-                if !self.upload_failed {
+                if self.failed_upload.is_none() {
                     log::error!("scene upload failed, keeping the previous picture: {reason}");
                 }
-                self.upload_failed = true;
+                self.failed_upload = Some((key, reason.clone()));
                 if let Ok(mut pending) = slot.lock()
                     && pending.is_none()
                 {
@@ -2698,10 +2706,16 @@ impl Batches {
             self.uploads = UploadStats::default();
             self.projection = sc.projected_shadow.clone();
             self.shadow_fallback = sc.projected_shadow.as_ref().and_then(|p| upload(device, "sc_shadow_fallback", &p.fallback, TRI_SIZE));
+            if upload_refused() {
+                return;
+            }
             self.planned = match tess {
                 Some((tess, encoder)) => self.planned(device, queue, tess, encoder, &sc.planned, donor.as_deref_mut()),
                 None => Vec::new(),
             };
+            if upload_refused() {
+                return;
+            }
             // On a device that draws them indirectly, the meshes go into the arena (only those it
             // lacks are uploaded) and are drawn from it, even one at a time: none is uploaded twice.
             self.arena = if indirect::supported(device) {
@@ -2719,16 +2733,28 @@ impl Batches {
             } else {
                 None
             };
+            if upload_refused() {
+                return;
+            }
             let arena = self.arena.clone();
             self.instanced = self.instanced(device, &sc.instanced, donor.as_deref(), arena.as_deref());
+            if upload_refused() {
+                return;
+            }
             self.instance_rows = sc.instance_rows.clone();
             self.hover_cpu = None;
             self.indirect = arena.clone().and_then(|a| indirect::Indirect::new(device, &self.instanced, a));
+            if upload_refused() {
+                return;
+            }
             // The instanced edges, and the lit ones drawn again over them, from one segment
             // buffer: a lit part's edges are the model's (this scene's, or the model scene's for
             // the highlight), uploaded once.
             let mut uploaded = 0;
             let mut shared_edges = |parts: &[edges::Part<'_>], before: Option<&edges::Edges>| {
+                if upload_refused() {
+                    return None;
+                }
                 let (e, up) = edges::Edges::new(device, queue, bgl.edges.as_ref()?, parts, before)?;
                 uploaded += up;
                 Some(e)
@@ -2745,6 +2771,9 @@ impl Batches {
             self.lit_shared_edges = shared_edges(&lit_parts, lit_from);
             let lit_hidden_parts = edges::Part::of_meshes(&sc.lit_instanced_hidden);
             self.lit_shared_hidden = shared_edges(&lit_hidden_parts, lit_from);
+            if upload_refused() {
+                return;
+            }
             let spill = Spill {
                 instanced: self.edges.is_none() && !parts.is_empty(),
                 lit: self.lit_shared_edges.is_none() && !lit_parts.is_empty(),
@@ -2771,10 +2800,16 @@ impl Batches {
             } else {
                 self.instanced(device, &sc.selected_face_instanced, model, arena.as_deref())
             };
+            if upload_refused() {
+                return;
+            }
             let mut kept = std::mem::take(&mut self.blocks);
             let mut order = Vec::with_capacity(sc.blocks.len());
             let mut geometry = 0;
             for block in &sc.blocks {
+                if upload_refused() {
+                    return;
+                }
                 // A block the other scene drawn in this frame holds with the same bytes (a dragged
                 // component's bodies moving between the model scene and the layer) is taken over
                 // rather than uploaded again.
@@ -2793,8 +2828,14 @@ impl Batches {
                 self.blocks.insert(block.key, BlockGpu::update(device, queue, old, block.bytes.clone(), &mut geometry));
                 order.push(block.key);
             }
+            if upload_refused() {
+                return;
+            }
             self.block_order = order;
             let mut own = |label: &str, data: &[u8], stride: usize| {
+                if upload_refused() {
+                    return None;
+                }
                 geometry += data.len() as u64;
                 upload(device, label, data, stride)
             };
@@ -2813,6 +2854,9 @@ impl Batches {
             self.under = own("sc_under", &sc.under, LINE_SIZE);
             self.guide_trans = own("sc_guide_trans", &sc.guide_trans, TRI_SIZE);
             self.guide_lines = own("sc_guide_lines", &sc.guide_lines, LINE_SIZE);
+            if upload_refused() {
+                return;
+            }
             let blocks: Vec<&BlockGpu> = self.block_order.iter().filter_map(|k| self.blocks.get(k)).collect();
             self.lines = joined(blocks.iter().map(|b| &b.lines), own_lines);
             self.hidden = joined(blocks.iter().map(|b| &b.hidden), own_hidden);
@@ -2883,6 +2927,9 @@ impl Batches {
         let mut kept = std::mem::take(&mut self.instanced_tris);
         let mut out = Vec::with_capacity(meshes.len());
         for (mesh, m) in meshes.iter().enumerate() {
+            if upload_refused() {
+                break;
+            }
             let count = u32::try_from(m.count()).unwrap_or(u32::MAX);
             if count == 0 {
                 continue;
@@ -2890,6 +2937,9 @@ impl Batches {
             let placements = m.instances.get(..count as usize * INSTANCE_SIZE).unwrap_or_default().to_vec();
             let mut levels = Vec::with_capacity(1 + m.levels.len());
             for (i, (tris, error)) in std::iter::once((&m.tris, 0.0f32)).chain(m.levels.iter().map(|(t, e)| (t, *e))).enumerate() {
+                if upload_refused() {
+                    break;
+                }
                 let key = Arc::as_ptr(tris) as usize;
                 let shared = || {
                     let scene = donor?;
@@ -3232,20 +3282,22 @@ impl Batches {
             std::hash::Hash::hash(&(Arc::as_ptr(&b.plan) as usize), &mut h);
             open = !std::hash::Hasher::finish(&h).is_multiple_of(CHUNK_SPLIT) && chunks.last().is_some_and(|c| c.len() < MAX_CHUNK_BODIES);
         }
-        let key = |c: &[&PlannedBody]| c.iter().map(|b| Arc::as_ptr(&b.plan) as usize).collect::<Vec<usize>>();
         // Looked up, not searched for: a large model has thousands of chunks.
-        let live: std::collections::HashSet<Vec<usize>> = chunks.iter().map(|c| key(c)).collect();
-        self.resident.retain(|k, _| live.contains(k));
-        self.chunk_colors.retain(|k, _| live.contains(k));
+        let chunk_keys: Vec<Vec<usize>> = chunks.iter().map(|c| c.iter().map(|b| Arc::as_ptr(&b.plan) as usize).collect()).collect();
+        let live: std::collections::HashSet<&[usize]> = chunk_keys.iter().map(Vec::as_slice).collect();
+        self.resident.retain(|k, _| live.contains(k.as_slice()));
+        self.chunk_colors.retain(|k, _| live.contains(k.as_slice()));
         let mut out = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            let k = key(chunk);
+        for (chunk, k) in chunks.iter().zip(chunk_keys) {
+            if upload_refused() {
+                break;
+            }
             if !self.resident.contains_key(&k)
                 && let Some(shared) = donor.as_deref_mut().and_then(|d| d.resident.remove(&k))
             {
-                self.resident.insert(k, shared);
+                self.resident.insert(k.clone(), shared);
             }
-            let mesh = match self.resident.get(&key(chunk)) {
+            let mesh = match self.resident.get(&k) {
                 Some((_, m)) => m.clone(),
                 None => {
                     let plans: Vec<&solidcore_tess::TessPlan> = chunk.iter().map(|b| &*b.plan).collect();
@@ -3254,7 +3306,7 @@ impl Batches {
                             self.uploads.evaluated += plans.iter().map(|p| p.vertex_count() as u64).sum::<u64>();
                             tess.record(encoder, &m);
                             let m = Arc::new(m);
-                            self.resident.insert(key(chunk), (chunk.iter().map(|b| b.plan.clone()).collect(), m.clone()));
+                            self.resident.insert(k.clone(), (chunk.iter().map(|b| b.plan.clone()).collect(), m.clone()));
                             m
                         }
                         Err(e) => {
@@ -3272,9 +3324,9 @@ impl Batches {
                 }
                 std::hash::Hasher::finish(&h)
             };
-            if let Some((_, colors)) = self.chunk_colors.get(&key(chunk)).filter(|(l, _)| *l == looks) {
+            if let Some((_, colors)) = self.chunk_colors.get(&k).filter(|(l, _)| *l == looks) {
                 let (class, closed) = chunk.first().map_or((TriClass::Opaque, true), |b| (b.class, b.closed));
-                out.push(PlannedDraw { mesh, colors: colors.clone(), class, closed, plans: key(chunk) });
+                out.push(PlannedDraw { mesh, colors: colors.clone(), class, closed, plans: k });
                 continue;
             }
             let mut bytes = Vec::with_capacity(mesh.vertex_face.len() * 4);
@@ -3288,8 +3340,8 @@ impl Batches {
             self.uploads.planned += bytes.len() as u64;
             if let Some((colors, _)) = upload_write(device, queue, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
                 let (class, closed) = chunk.first().map_or((TriClass::Opaque, true), |b| (b.class, b.closed));
-                self.chunk_colors.insert(key(chunk), (looks, colors.clone()));
-                out.push(PlannedDraw { mesh, colors, class, closed, plans: key(chunk) });
+                self.chunk_colors.insert(k.clone(), (looks, colors.clone()));
+                out.push(PlannedDraw { mesh, colors, class, closed, plans: k });
             }
         }
         out
@@ -3399,7 +3451,10 @@ pub struct Renderer {
     pbr_palette: wgpu::RenderPipeline,
     /// `pbr_palette` for placements of a shared smooth mesh ([`InstanceLook::Pbr`]).
     pbr_instanced: wgpu::RenderPipeline,
+    /// Unbiased translucent overlays (sketch fills and highlights) drawn over opaque faces.
     trans: wgpu::RenderPipeline,
+    /// Faded model faces (non-OIT fallback), pushed back by [`SEE_THROUGH_BIAS`].
+    faded: wgpu::RenderPipeline,
     /// Glass: far sides (front faces culled), then near sides (back faces culled).
     glass_far: wgpu::RenderPipeline,
     glass_near: wgpu::RenderPipeline,
@@ -4078,7 +4133,10 @@ impl Renderer {
             })
         };
         let alpha = Some(wgpu::BlendState::ALPHA_BLENDING);
+        let see_through_depth = || split_push(pushed(wgpu::CompareFunction::LessEqual, false, SEE_THROUGH_BIAS));
         let glass = |label: &str, cull: wgpu::Face| {
+            let (ds, push) = see_through_depth();
+            let push = face_push(push);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -4086,10 +4144,10 @@ impl Renderer {
                     module: &module,
                     entry_point: Some("vs_tri"),
                     buffers: &[Some(tri_layout())],
-                    compilation_options: Default::default(),
+                    compilation_options: push_options(&push),
                 },
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(cull), ..Default::default() },
-                depth_stencil: depth(wgpu::CompareFunction::LessEqual, false),
+                depth_stencil: ds,
                 multisample: wgpu::MultisampleState { count: t.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
@@ -4104,6 +4162,8 @@ impl Renderer {
         // See-through instanced meshes: blended, depth tested, not written; `cull` for glass.
         let placed_see_through = [Some(shared_layout()), Some(instance_layout())];
         let see_through = |label: &str, source: TriSource, cull: Option<wgpu::Face>| {
+            let (ds, push) = see_through_depth();
+            let push = face_push(push);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -4111,10 +4171,10 @@ impl Renderer {
                     module: &module,
                     entry_point: Some(source.entry()),
                     buffers: &placed_see_through,
-                    compilation_options: Default::default(),
+                    compilation_options: push_options(&push),
                 },
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: cull, ..Default::default() },
-                depth_stencil: depth(wgpu::CompareFunction::LessEqual, false),
+                depth_stencil: ds,
                 multisample: wgpu::MultisampleState { count: t.samples.max(1), mask: !0, alpha_to_coverage_enabled: false },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
@@ -4425,6 +4485,7 @@ impl Renderer {
             (
                 pipeline("sc_tris_hl", "vs_tri", "fs_tri", tri_layout(), highlight_depth(t.depth), alpha),
                 pipeline("sc_trans", "vs_tri", "fs_tri", tri_layout(), depth(wgpu::CompareFunction::LessEqual, false), alpha),
+                pipeline("sc_faded", "vs_tri", "fs_tri", tri_layout(), pushed(wgpu::CompareFunction::LessEqual, false, SEE_THROUGH_BIAS), alpha),
                 glass("sc_glass_far", wgpu::Face::Front),
                 glass("sc_glass_near", wgpu::Face::Back),
                 pipeline("sc_ghost", "vs_tri", "fs_tri", tri_layout(), pushed(wgpu::CompareFunction::LessEqual, false, GHOST_BIAS), alpha),
@@ -4525,6 +4586,7 @@ impl Renderer {
             let (
                 tri_hl,
                 trans,
+                faded,
                 glass_far,
                 glass_near,
                 ghost,
@@ -4665,6 +4727,7 @@ impl Renderer {
                 pbr_palette,
                 pbr_instanced,
                 trans,
+                faded,
                 glass_far,
                 glass_near,
                 ghost,
@@ -4735,12 +4798,15 @@ pub const FACE_STEPS: i32 = 8;
 /// which writes its own depth, adds the same in the shader.
 pub const FACE_SLOPE: f32 = 1.0;
 /// The model's edges' depth, written before its see-through faces are drawn (`line_depth`): pushed
-/// back as [`FACE_BIAS`] pushes an opaque face, so a see-through body's own faces at its edges
-/// still pass and tint them, while a face further behind (faded context, another see-through body)
-/// fails and leaves the edge alone. The slope term is the line's own (flat across its width), so
-/// where a body's face recedes steeply from its edge, the part of it under the line's far half is
-/// behind the line and does not tint it, as an opaque face does not cover its edge.
+/// back as [`FACE_BIAS`] pushes an opaque face, so a see-through face at or behind an edge fails
+/// and leaves the edge crisp, while a see-through face in front of an edge still passes and tints
+/// it.
 const EDGE_DEPTH_BIAS: wgpu::DepthBiasState = FACE_BIAS;
+/// See-through model faces (glass and faded bodies): pushed back by the same slope as
+/// [`FACE_BIAS`], and one [`FACE_STEPS`] further, so an opaque face lying flush on or coplanar
+/// with a see-through face stays in front of it at any viewing angle, while a thin see-through
+/// face in front of an opaque one still shows over it (#23422).
+pub(super) const SEE_THROUGH_BIAS: wgpu::DepthBiasState = wgpu::DepthBiasState { constant: 2 * FACE_STEPS, slope_scale: FACE_SLOPE, clamp: 0.0 };
 /// A blend that leaves the target's colour as it is.
 const KEEP: wgpu::BlendComponent =
     wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
@@ -4825,7 +4891,7 @@ fn upload_write(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: 
 
 /// `bytes` of `stride` in as many buffers made by `buffer` as the device's limit takes.
 fn batch(device: &wgpu::Device, bytes: &[u8], stride: usize, buffer: impl Fn(&[u8]) -> Option<wgpu::Buffer>) -> Option<Batch> {
-    if bytes.len() < stride || stride == 0 {
+    if bytes.len() < stride || stride == 0 || upload_refused() {
         return None;
     }
     let chunk = buffer_chunk(stride, device.limits().max_buffer_size);
@@ -4897,9 +4963,13 @@ fn spilled_lines(sc: &GpuScene, spill: Spill) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// [`crate::buffer_init`] for the scene uploads: `None` (as an empty upload) when the device
-/// refused the buffer, with the reason kept for [`take_upload_failure`] so the whole scene's
-/// upload can fail and leave the previous picture in place.
+/// refused the buffer (or already refused an earlier buffer in this upload), with the reason kept
+/// for [`take_upload_failure`] so the whole scene's upload can fail and leave the previous picture
+/// in place without cascading invalid-buffer errors.
 fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+    if upload_refused() {
+        return None;
+    }
     match crate::buffer_init(device, label, contents, usage) {
         Ok(buffer) => Some(buffer),
         Err(error) => {
@@ -4911,6 +4981,9 @@ fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu:
 
 /// As [`buffer_init`], written through `queue` ([`crate::buffer_write`]).
 fn buffer_write(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+    if upload_refused() {
+        return None;
+    }
     match crate::buffer_write(device, queue, label, contents, usage) {
         Ok(buffer) => Some(buffer),
         Err(error) => {
@@ -5960,12 +6033,12 @@ impl Renderer {
         in_moving(pass, &|pass, mv| {
             tris(pass, &res.glass_near, &mv.glass);
             see_through(pass, InstanceLook::Glass, &res.glass_near_instanced, mv);
-            tris(pass, &res.trans, &mv.trans);
-            blocks_of(pass, &res.trans, TriClass::Faded, mv);
+            tris(pass, &res.faded, &mv.trans);
+            blocks_of(pass, &res.faded, TriClass::Faded, mv);
             see_through(pass, InstanceLook::Faded, &res.trans_instanced, mv);
         });
-        tris(pass, &res.trans, &m.trans);
-        block_class(pass, &res.trans, TriClass::Faded);
+        tris(pass, &res.faded, &m.trans);
+        block_class(pass, &res.faded, TriClass::Faded);
         see_through(pass, InstanceLook::Faded, &res.trans_instanced, m);
         Self::draw_over(res, pass, sk, h, pv, m, moving, &tris, &lines);
     }
@@ -6748,6 +6821,89 @@ mod tests {
         batches.take(&device, &queue, &r.uniform, &r.uniform_bgl, 3, &slot, None, false).unwrap();
         assert_eq!(batches.key, Some(3));
         assert!(Arc::ptr_eq(&batches.blocks[&7].bytes, &newer.bytes));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    /// Once a scene upload has been refused, subsequent buffer uploads short-circuit without
+    /// calling into the device (no cascading invalid-buffer errors), and `Batches::take` does not
+    /// tight-loop retrying the same refused scene key on every repaint frame (#23651).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn upload_short_circuits_after_refusal_and_skips_same_failed_key() {
+        use super::*;
+        let Ok((_, device, queue)) = crate::open_headless(crate::test_env::policy()) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let _ = take_upload_failure();
+        refused("GPU out of memory".to_string());
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let bad_usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::VERTEX;
+        assert!(buffer_init(&device, "sc_short_circuit_init", &[0; 64], bad_usage).is_none());
+        assert!(buffer_write(&device, &queue, "sc_short_circuit_write", &[0; 64], bad_usage).is_none());
+        assert!(upload_with(&device, "sc_short_circuit_upload", &[0; 288], PBR_SIZE, bad_usage).is_none());
+        assert!(upload_write(&device, &queue, "sc_short_circuit_upload_write", &[0; 288], TRI_SIZE).is_none());
+        assert!(pollster::block_on(scope.pop()).is_none(), "short-circuited uploads must not call device.create_buffer");
+        assert_eq!(take_upload_failure().as_deref(), Some("GPU out of memory"));
+
+        // Verify `upload_scene` skips trailing buffers and `glass_cpu`, and `Batches::take` does
+        // not re-attempt the same failed scene key until a different key arrives.
+        let Some((adapter, _)) = crate::select::pick(crate::test_env::policy()) else { return };
+        let limits = wgpu::Limits { max_buffer_size: 3072, ..wgpu::Limits::downlevel_defaults() };
+        let Ok((small_device, small_queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() }))
+        else {
+            return;
+        };
+        let block = |runs: usize| SceneBlock {
+            key: 7,
+            bytes: Arc::new(BlockBytes { vertices: Arc::new(vec![0; 3 * TRI_SIZE]), opaque: Arc::new(vec![0..1; runs]), ..BlockBytes::default() }),
+        };
+        let oversized = GpuScene {
+            blocks: vec![block(1024)],
+            tris: vec![0; 3 * TRI_SIZE],
+            shadow: vec![0; 3 * TRI_SIZE],
+            guide_trans: vec![0; 3 * TRI_SIZE],
+            glass: vec![0; 3 * TRI_SIZE],
+            palette: Arc::new(Palette::with_stable(vec![[9, 9, 9, 255]])),
+            ..GpuScene::default()
+        };
+        let valid = GpuScene { blocks: vec![block(1)], palette: Arc::new(Palette::with_stable(vec![[1, 2, 3, 255]])), ..GpuScene::default() };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let r = Renderer::new(&small_device, GpuTarget { format, depth: None, samples: 1, tess: false, oit: false, edges: false }, None);
+
+        let _ = take_upload_failure();
+        let mut probe = Batches::default();
+        probe.upload_scene(&small_device, &small_queue, &r.uniform, &r.uniform_bgl, 2, &oversized, None, false, None, None);
+        assert!(upload_refused());
+        assert!(probe.tris.is_none(), "trailing sc_tris must be skipped after refusal");
+        assert!(probe.shadow.is_none(), "trailing sc_shadow must be skipped after refusal");
+        assert!(probe.guide_trans.is_none(), "trailing sc_guide_trans must be skipped after refusal");
+        assert!(probe.glass.is_none(), "trailing sc_glass must be skipped after refusal");
+        assert!(probe.glass_cpu.is_empty(), "glass_cpu copy must be skipped after refusal");
+        assert!(probe.palette.is_none(), "palette update must be skipped after refusal");
+        assert!(take_upload_failure().is_some());
+
+        let mut batches = Batches::default();
+        let slot: SceneSlot = Arc::new(Mutex::new(Some(valid.clone())));
+        batches.take(&small_device, &small_queue, &r.uniform, &r.uniform_bgl, 1, &slot, None, false).unwrap();
+        assert_eq!(batches.key, Some(1));
+
+        *slot.lock().unwrap() = Some(oversized);
+        let first_err = batches.take(&small_device, &small_queue, &r.uniform, &r.uniform_bgl, 2, &slot, None, false).unwrap_err();
+        assert_eq!(batches.key, Some(1));
+
+        // Even if the slot now holds a small valid scene, repeating the exact same refused key
+        // must short-circuit without consuming the slot or re-running `upload_scene`.
+        *slot.lock().unwrap() = Some(valid);
+        let second_err = batches.take(&small_device, &small_queue, &r.uniform, &r.uniform_bgl, 2, &slot, None, false).unwrap_err();
+        assert_eq!(second_err, first_err);
+        assert_eq!(batches.key, Some(1));
+        assert!(slot.lock().unwrap().is_some(), "same failed key must not retry or take from slot");
+
+        // A newer key clears the failure and uploads normally.
+        batches.take(&small_device, &small_queue, &r.uniform, &r.uniform_bgl, 3, &slot, None, false).unwrap();
+        assert_eq!(batches.key, Some(3));
         assert!(slot.lock().unwrap().is_none());
     }
 
@@ -7887,9 +8043,23 @@ mod glass_tests {
 
     /// [`middle_pixel_cut`] into a target of `format`.
     fn middle_pixel_on(format: wgpu::TextureFormat, scene: GpuScene, sketch: GpuScene, oit: bool, samples: u32, clip: [f32; 4]) -> Option<[u8; 4]> {
+        middle_pixel_on_depth(format, None, scene, sketch, oit, samples, clip)
+    }
+
+    /// [`middle_pixel_on`] with an optional explicit depth format (to test both reversed and
+    /// standard depth buffers).
+    fn middle_pixel_on_depth(
+        format: wgpu::TextureFormat,
+        depth_override: Option<wgpu::TextureFormat>,
+        scene: GpuScene,
+        sketch: GpuScene,
+        oit: bool,
+        samples: u32,
+        clip: [f32; 4],
+    ) -> Option<[u8; 4]> {
         const SIZE: u32 = 64;
         let (_, device, queue) = crate::open_headless(crate::test_env::policy()).ok()?;
-        let depth = crate::depth_format(&device, true);
+        let depth = depth_override.unwrap_or_else(|| crate::depth_format(&device, true));
         let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples, tess: false, oit: false, edges: false }, None);
         assert!(r.oit.is_some(), "this device does order-independent transparency");
         if !oit {
@@ -9214,6 +9384,92 @@ mod glass_tests {
             let thin_alone = middle_pixel(scene(5.0, None, 0.75), oit).unwrap();
             let thin = middle_pixel(scene(5.0, Some(true), 0.75), oit).unwrap();
             assert!(!near(thin, thin_alone), "oit {oit}: the faded face behind still shows past a thin line: {thin:?} vs {thin_alone:?}");
+        }
+    }
+
+    /// Regression test for #23422: at an oblique angle, opaque faces pushed back by [`FACE_BIAS`]
+    /// must still beat flush or coplanar see-through model faces (glass or faded), while a thin
+    /// see-through face in front of an opaque face and a sketch overlay coplanar with an opaque
+    /// face still show over it. Tested with both OIT and sorted fallback, on both reversed and
+    /// standard depth buffers.
+    #[test]
+    fn opaque_face_flush_on_see_through_face_stays_in_front_at_oblique_angle() {
+        let white = [250, 250, 250, 255];
+        let green = [32, 128, 64, 191];
+        let n = [0.0, -std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
+        let add_tilted = |sc: &mut GpuScene, half: f32, z_off: f32, col: PaletteIndex, kind: u8| {
+            let pts = [[-half, -half], [half, -half], [half, half], [-half, -half], [half, half], [-half, half]];
+            for [x, y] in pts {
+                let p = [x, y, y + z_off];
+                match kind {
+                    0 => sc.tri(p, n, col),
+                    1 => sc.glass_tri(p, n, col),
+                    _ => sc.trans_tri(p, n, col),
+                }
+            }
+        };
+        let near = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
+
+        for (depth_fmt, oit) in
+            [(wgpu::TextureFormat::Depth32Float, true), (wgpu::TextureFormat::Depth32Float, false), (wgpu::TextureFormat::Depth24Plus, false)]
+        {
+            let run_px =
+                |sc: GpuScene, sk: GpuScene| middle_pixel_on_depth(wgpu::TextureFormat::Rgba8Unorm, Some(depth_fmt), sc, sk, oit, 1, [0.0; 4]);
+
+            // Baseline: opaque white tilted quad alone at z = y + 0.01.
+            let mut solo = GpuScene::default();
+            let cw = solo.color(white);
+            add_tilted(&mut solo, 4.0, 0.01, cw, 0);
+            let Some(opaque_alone) = run_px(solo, GpuScene::default()) else {
+                eprintln!("skipping: no GPU adapter");
+                return;
+            };
+            assert!(opaque_alone[0] > 180 && opaque_alone[0].abs_diff(opaque_alone[1]) <= 2, "baseline should be neutral white: {opaque_alone:?}");
+
+            // 1. Thin (0.01 mm) opaque white face lying flush on a tilted glass green face (z = y):
+            // 1 px of slope is 0.3125 mm >> 0.01 mm, so without SEE_THROUGH_BIAS the glass covers it.
+            let mut flush_glass = GpuScene::default();
+            let (cw, cg) = (flush_glass.color(white), flush_glass.color(green));
+            add_tilted(&mut flush_glass, 8.0, 0.0, cg, 1);
+            add_tilted(&mut flush_glass, 4.0, 0.01, cw, 0);
+            let px = run_px(flush_glass, GpuScene::default()).unwrap();
+            assert!(near(px, opaque_alone), "{depth_fmt:?} oit={oit}: flush opaque on glass covered by glass: {px:?} vs {opaque_alone:?}");
+
+            // 2. Exactly coplanar opaque face (z = y, half=4) on glass face (z = y, half=8):
+            // opaque must win without z-fighting despite different triangle extents.
+            let mut coplanar = GpuScene::default();
+            let (cw, cg) = (coplanar.color(white), coplanar.color(green));
+            add_tilted(&mut coplanar, 8.0, 0.0, cg, 1);
+            add_tilted(&mut coplanar, 4.0, 0.0, cw, 0);
+            let px = run_px(coplanar, GpuScene::default()).unwrap();
+            assert!(near(px, opaque_alone), "{depth_fmt:?} oit={oit}: coplanar opaque on glass covered by glass: {px:?} vs {opaque_alone:?}");
+
+            // 3. Reverse: thin (0.01 mm) glass green face IN FRONT OF opaque white face must still
+            // show over it at the same oblique angle.
+            let mut glass_on_opaque = GpuScene::default();
+            let (cw, cg) = (glass_on_opaque.color(white), glass_on_opaque.color(green));
+            add_tilted(&mut glass_on_opaque, 8.0, 0.0, cw, 0);
+            add_tilted(&mut glass_on_opaque, 4.0, 0.01, cg, 1);
+            let px = run_px(glass_on_opaque, GpuScene::default()).unwrap();
+            assert!(px[1] > px[0] + 20, "{depth_fmt:?} oit={oit}: thin glass in front of opaque must tint it green: {px:?}");
+
+            // 4. Flush opaque white face on faded model face (m.trans) must also stay in front.
+            let mut flush_faded = GpuScene::default();
+            let (cw, cg) = (flush_faded.color(white), flush_faded.color(green));
+            add_tilted(&mut flush_faded, 8.0, 0.0, cg, 2);
+            add_tilted(&mut flush_faded, 4.0, 0.01, cw, 0);
+            let px = run_px(flush_faded, GpuScene::default()).unwrap();
+            assert!(near(px, opaque_alone), "{depth_fmt:?} oit={oit}: flush opaque on faded covered: {px:?} vs {opaque_alone:?}");
+
+            // 5. Sketch translucent fill (sk.trans) coplanar with an opaque face stays in front.
+            let mut base = GpuScene::default();
+            let cw = base.color(white);
+            add_tilted(&mut base, 8.0, 0.0, cw, 0);
+            let mut sk = GpuScene::default();
+            let cg = sk.color(green);
+            add_tilted(&mut sk, 4.0, 0.0, cg, 2);
+            let px = run_px(base, sk).unwrap();
+            assert!(px[1] > px[0] + 20, "{depth_fmt:?} oit={oit}: coplanar sketch fill must still tint opaque face: {px:?}");
         }
     }
 

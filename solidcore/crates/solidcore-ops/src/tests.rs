@@ -206,6 +206,27 @@ fn a_local_check_passes_where_the_body_does() {
     assert!(past(&[], &[order.edges.len()]));
 }
 
+/// A box's faces are planes whose u and v directions are square everywhere: none has a flat
+/// corner. A face past the record's is an argument error. (A surface with flat corners is
+/// SolidCraft's boundary surface over a loop of tangent arcs, tested where it is built.)
+#[test]
+fn a_box_has_no_flat_corners() {
+    all_fixes();
+    let b = make_box([0.0; 3], [10.0, 20.0, 30.0]).unwrap();
+    let order = b.to_record().unwrap().1;
+    for f in 0..order.faces.len() {
+        assert_eq!(
+            b.face_flat_corners(&order, f).unwrap(),
+            Vec::<[f64; 3]>::new(),
+            "face {f}"
+        );
+    }
+    assert!(matches!(
+        b.face_flat_corners(&order, order.faces.len()),
+        Err(Error::Argument)
+    ));
+}
+
 /// The local check runs the tolerance pass on the edges it is given. A box edge whose curve is
 /// moved 0.01 off its two faces (its tolerance is 5e-6) fails it there, with the pass's own
 /// reports (`SmBrep` list 2 about the edge's uses): its vertex/edge gaps (tests 0 and 2) and its
@@ -1882,6 +1903,18 @@ fn periodic_seam_completion_keeps_every_trim_over_its_edge_interval() {
     crate::record_check::validate(&completed).unwrap();
     crate::record_check::agreement(&completed).unwrap();
     assert!(crate::pcurve::import_check_failure(&completed).is_none());
+    // The completed record is the kernel's own, so it is not held to the item cap for input:
+    // the budget is the file's, set where the file is read. A record past that cap may still
+    // disagree with its geometry, but its size is not the reason it is refused.
+    let mut large = completed.clone();
+    large.edges[0].curve = Curve::Polyline {
+        points: (0..solidcore_record::brep::MAX_ITEMS)
+            .map(|i| [i as f64 * 1e-6, 0., 0.])
+            .collect(),
+    };
+    assert_eq!(large.validate().map_err(|e| e.0), Err("item budget"));
+    let why = crate::pcurve::import_check_failure(&large).unwrap_or_default();
+    assert!(!why.contains("the completed record is invalid"), "{why}");
     // A completion that leaves a trim over only the first half of its edge's interval, as
     // rebuilding a split edge's trim by sampling did for a real model, is refused by the
     // record's validity check, so the import keeps the record it had.
@@ -1980,4 +2013,36 @@ fn pcurves_of_malformed_records_are_refused_as_invalid() {
     assert!(matches!(one(&collapsed, [0., 1.]), Err(Error::Invalid(_))));
     // And a well-formed one still gets its pcurve.
     assert!(one(&line, [0., 1.]).is_ok());
+}
+
+/// The public reducer must carry the new Core orientation refusal through Ops,
+/// rather than flattening its typed cause into an unexplained `SM_ERR` status.
+#[test]
+fn mesh_reduction_preserves_the_uncertified_orientation_reason() {
+    use solidcore::error::mass::MassFailure;
+    let positions = [[0., 0., 0.], [2., 0., 0.], [0., 2., 0.], [0.5, 0.5, 0.]];
+    // Four nondegenerate coplanar facets form a zero-volume tetrahedral incidence;
+    // the fifth record repeats the first, so this is only the new duplicate path.
+    let indices = [0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3, 0, 2, 1];
+    let error = crate::reduce_mesh(&positions, &indices, None, 4).unwrap_err();
+    assert_eq!(
+        error,
+        Error::Refused {
+            operation: "mesh.reduce",
+            reason: MassFailure::MESH_VOLUME_SIGN_UNCERTAIN_REASON,
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "mesh.reduce: {}",
+            MassFailure::MESH_VOLUME_SIGN_UNCERTAIN_REASON
+        )
+    );
+    // Existing mass failures still retain their old status-only policy.
+    let other = solidcore::error::Failure::new("mass::op", MassFailure::Integrand).into_error();
+    assert_eq!(
+        crate::error::status(other),
+        Error::Status(solidcore::error::SM_ERR)
+    );
 }

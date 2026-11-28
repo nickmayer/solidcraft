@@ -483,7 +483,7 @@ pub fn tool_choices<'a>(ui: &mut Ui, label: &str, current: &str, choices: &[Tool
                 egui::Button::new("")
                     .fill(fill)
                     .stroke(if on { egui::Stroke::new(t.sketch_mode_border, t.sketch_accent) } else { t.control_border_stroke(t.control_border) })
-                    .corner_radius(t.sketch_mode_radius)
+                    .corner_radius(t.control_radius)
                     .min_size(vec2(t.sketch_mode_size, t.sketch_mode_size)),
             );
             crate::icons::paint_icon(ui.painter(), response.rect.shrink(t.space_6), choice.icon, f32::from(t.icon.a()) / 255.0);
@@ -514,6 +514,62 @@ pub fn toggle_icon(ui: &mut Ui, row: &str, label: &str, selected: &mut bool, ico
     }
     solidcraft_ui_registry::publish_rect(&format!("dialog:{row}:{label}"), response.rect);
     response
+}
+
+/// One button of [`icon_choices`]: a registry handle, the icon to draw and its hover text.
+pub struct IconChoice<'a> {
+    pub key: &'a str,
+    pub icon: &'a str,
+    pub tip: &'a str,
+}
+
+/// A left-aligned row of square icon buttons; `on` says which are selected (one for a choice,
+/// any for toggles). A selected button has the surface's accent fill, and its icon is drawn for the
+/// ink that reads on that fill (the lighter dark-surface artwork under a light ink), so it follows
+/// the theme, the accent and the colour vision. `None`, drawing nothing, when the row is wider than
+/// the space left; else the row's response (changed on a click) and the clicked button.
+/// Buttons are a form row high, so the row fits a dialog row. Tokens: `control_height/radius, space_4/6, control_fill/border, hover, accent, on_accent, icon`.
+pub fn icon_choices(ui: &mut Ui, options: &[IconChoice<'_>], on: &[bool]) -> Option<(egui::Response, Option<usize>)> {
+    let t = Tokens::get();
+    let side = t.control_height;
+    let width = side * options.len() as f32 + t.space_4 * options.len().saturating_sub(1) as f32;
+    if options.is_empty() || width > ui.available_width() {
+        return None;
+    }
+    let (rect, mut row) = ui.allocate_exact_size(vec2(width, side), egui::Sense::hover());
+    let accent = solidcraft_theme::TabAccent::current(ui.ctx());
+    let ink = accent.on_fill(&t);
+    let light_ink = u16::from(ink.r()) + u16::from(ink.g()) + u16::from(ink.b()) > 3 * 128;
+    let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
+    let mut clicked = None;
+    for (index, option) in options.iter().enumerate() {
+        let column = if rtl { options.len() - 1 - index } else { index };
+        let button = egui::Rect::from_min_size(rect.min + vec2(column as f32 * (side + t.space_4), 0.0), vec2(side, side));
+        let response = ui.interact(button, ui.make_persistent_id(("icon_choice", option.key)), egui::Sense::click());
+        let selected = on.get(index).copied().unwrap_or(false);
+        let fill = if selected {
+            accent.color
+        } else if response.hovered() {
+            t.hover
+        } else {
+            t.control_fill
+        };
+        ui.painter().rect_filled(button, t.control_radius, fill);
+        if !selected {
+            ui.painter().rect_stroke(button, t.control_radius, t.control_border_stroke(t.control_border), egui::StrokeKind::Inside);
+        }
+        let opacity = f32::from(t.icon.a()) / 255.0;
+        let dark = selected.then_some(light_ink);
+        crate::icons::paint_on(ui.painter(), button.shrink(t.space_6), option.icon, dark, opacity);
+        t.button_bevel(ui, &response, selected);
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, option.tip));
+        solidcraft_ui_registry::publish_target(option.key, button);
+        if response.backing_on_hover_text(option.tip).clicked() {
+            clicked = Some(index);
+            row.mark_changed();
+        }
+    }
+    Some((row, clicked))
 }
 
 #[cfg(test)]
@@ -604,7 +660,9 @@ pub fn swatch_picker(ui: &mut Ui, id: &str, chosen: &mut Option<usize>, options:
             ui.data_mut(|data| data.insert_temp(query_id, query.clone()));
         }
         let hover_id = ui.make_persistent_id(("swatch_hover", id));
-        if preview {
+        // While a search narrows the list the large picture gives way, so the matching tiles sit
+        // right under the search box instead of below the popup's fold (#23596).
+        if preview && query.is_empty() {
             // The highlighted option of the last frame, else the chosen one. The area is reserved
             // whether or not a picture shows, so the tiles never move under the pointer.
             let shown = ui.data(|data| data.get_temp::<usize>(hover_id)).or(*chosen);
@@ -621,13 +679,20 @@ pub fn swatch_picker(ui: &mut Ui, id: &str, chosen: &mut Option<usize>, options:
         let query = query.to_lowercase();
         let visible: Vec<_> = titles.iter().enumerate().filter(|(_, title)| !grid || title.to_lowercase().contains(&query)).collect();
         let side = if grid { t.control_height * 2.0 } else { t.control_height };
-        let width = side + t.space_16;
-        let columns = if grid { (ui.available_width() / width).floor().clamp(1.0, 8.0) as usize } else { 1 };
+        // Grid tiles share the row's width, so a label gets the room there is (#23596).
+        let gap = ui.spacing().item_spacing.x;
+        let narrowest = side + t.space_16;
+        let columns = if grid { ((ui.available_width() + gap) / (narrowest + gap)).floor().clamp(1.0, 8.0) as usize } else { 1 };
+        let width = ((ui.available_width() + gap) / columns as f32 - gap).floor().max(narrowest);
+        let label_font = egui::FontId::proportional(t.font_small);
+        let label_row = ui.fonts_mut(|fonts| fonts.row_height(&label_font));
         for row in visible.chunks(columns.max(1)) {
             ui.horizontal(|ui| {
                 for (index, title) in row {
                     let texture = textures.get(*index).copied().flatten();
-                    let size = if grid { vec2(width, side + t.control_height + t.space_8) } else { vec2(ui.available_width(), side + t.space_8) };
+                    // Two lines of label under a grid tile.
+                    let label = (2.0 * label_row + t.space_4).max(t.control_height);
+                    let size = if grid { vec2(width, side + label + t.space_8) } else { vec2(ui.available_width(), side + t.space_8) };
                     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
                     let selected = *chosen == Some(*index);
                     if response.hovered() {
@@ -641,7 +706,11 @@ pub fn swatch_picker(ui: &mut Ui, id: &str, chosen: &mut Option<usize>, options:
                         t.control_fill
                     };
                     ui.painter().rect(rect, t.control_radius, fill, t.control_border_stroke(t.control_border), egui::StrokeKind::Inside);
-                    let tile = egui::Rect::from_min_size(rect.min + vec2(t.space_4, t.space_4), vec2(side, side));
+                    let tile = if grid {
+                        egui::Rect::from_min_size(egui::pos2(rect.center().x - side / 2.0, rect.top() + t.space_4), vec2(side, side))
+                    } else {
+                        egui::Rect::from_min_size(rect.min + vec2(t.space_4, t.space_4), vec2(side, side))
+                    };
                     if let Some(texture) = texture {
                         let scale = (side / texture.size.x).min(side / texture.size.y);
                         let artwork = egui::Rect::from_center_size(tile.center(), texture.size * scale);
@@ -653,14 +722,12 @@ pub fn swatch_picker(ui: &mut Ui, id: &str, chosen: &mut Option<usize>, options:
                     } else {
                         egui::Rect::from_min_max(egui::pos2(tile.right() + t.space_8, rect.top()), rect.max - vec2(t.space_4, 0.0))
                     };
-                    paint_text(
-                        ui,
-                        text_rect,
-                        title,
-                        egui::FontId::proportional(t.font_small),
-                        if selected { t.selected_ink } else { t.form_ink },
-                        false,
-                    );
+                    let ink = if selected { t.selected_ink } else { t.form_ink };
+                    if grid {
+                        super::text::paint_two_lines(ui, text_rect.shrink2(vec2(0.0, t.space_2)), title, label_font.clone(), ink);
+                    } else {
+                        paint_text(ui, text_rect, title, label_font.clone(), ink, false);
+                    }
                     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, title.as_str()));
                     solidcraft_ui_registry::publish_target(&format!("swatch:{id}:option:{index}"), response.rect);
                     let response = response.backing_on_hover_text(title.as_str());

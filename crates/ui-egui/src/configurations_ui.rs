@@ -49,6 +49,26 @@ pub(super) fn configurations_rows(
                             .map_or(name, |joint| joint.name.as_str());
                         format!("{}: {joint_name}", solidcraft_ui_text::tr("config.suppress_joint"))
                     }
+                    "suppress_folder" => {
+                        let folder_name = app
+                            .session
+                            .doc
+                            .configs
+                            .columns
+                            .iter()
+                            .find(|column| {
+                                matches!(column, solidcraft_engine::doc::config::Column::SuppressFolder(_))
+                                    && app.session.doc.config_key(column) == *c
+                            })
+                            .and_then(|column| match column {
+                                solidcraft_engine::doc::config::Column::SuppressFolder(id) => {
+                                    app.session.doc.timeline_group(*id).map(|g| g.name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(name);
+                        solidcraft_ui_text::format("config.suppress_folder", &[("name", folder_name)])
+                    }
                     _ => name.to_owned(),
                 })
         }))
@@ -88,7 +108,7 @@ pub(super) fn configurations_rows(
                 } else {
                     match tb.columns.get(index - 1).map(|column| column_parts(column).0) {
                         Some("param") => 0.9,
-                        Some("suppress" | "suppress_joint") => 1.1,
+                        Some("suppress" | "suppress_joint" | "suppress_folder") => 1.1,
                         Some("material") => 1.2,
                         _ => 1.3,
                     }
@@ -228,7 +248,7 @@ pub(super) fn configurations_rows(
                 });
             }
             if rule_editor.adding_row {
-                let menu_was_open = egui::Popup::is_any_open(ui.ctx());
+                let menu_was_open = egui::Popup::is_any_open(ui.ctx()) || crate::ui_kit::Menu::any_open(ui.ctx());
                 let mut commit = false;
                 let mut discard = false;
                 let mut left = false;
@@ -258,7 +278,7 @@ pub(super) fn configurations_rows(
                                             .unwrap_or_default()
                                     });
                                     let (kind, _) = column_parts(column);
-                                    if matches!(kind, "suppress" | "suppress_joint") {
+                                    if matches!(kind, "suppress" | "suppress_joint" | "suppress_folder") {
                                         let (response, toggled) = suppress_box(ui, column, &value);
                                         crate::scenario::publish_handle(&format!("config:new:cell:{column}"), response.rect.center());
                                         if let Some(on) = toggled {
@@ -336,6 +356,7 @@ pub(super) fn configurations_rows(
             .map(|key| match column_parts(key) {
                 ("suppress", name) => format!("{} {name}", solidcraft_ui_text::tr_label("Suppress")),
                 ("suppress_joint", name) => format!("{} {name}", solidcraft_ui_text::tr("config.suppress_joint")),
+                ("suppress_folder", name) => solidcraft_ui_text::format("config.suppress_folder", &[("name", name)]),
                 (_, name) => name.to_owned(),
             })
             .collect();
@@ -407,6 +428,22 @@ fn swapped_id() -> egui::Id {
 /// Remove `column` (a column key) from the table.
 fn remove_column(app: &mut SolveApp, error: &mut Option<String>, column: &str) {
     let (kind, name) = column_parts(column);
+    if kind == "suppress_folder" {
+        let id = app
+            .session
+            .doc
+            .configs
+            .columns
+            .iter()
+            .find(|c| matches!(c, solidcraft_engine::doc::config::Column::SuppressFolder(_)) && app.session.doc.config_key(c) == column)
+            .and_then(|c| match c {
+                solidcraft_engine::doc::config::Column::SuppressFolder(id) => Some(json!(*id)),
+                _ => None,
+            })
+            .unwrap_or_else(|| json!(name));
+        *error = app.run("config.column", json!({"folder": id, "delete": true})).err();
+        return;
+    }
     let (key, value) = match kind {
         "suppress" => ("feature", name),
         "suppress_joint" => ("joint", column),
@@ -492,6 +529,15 @@ fn column_menu(
             options.push((solidcraft_ui_text::format("config.add_suppress_joint", &[("name", &j.name)]), json!({ "joint": j.id })));
         }
     }
+    for group in &app.session.doc.timeline_groups {
+        let key = app.session.doc.config_key(&solidcraft_engine::doc::config::Column::SuppressFolder(group.id));
+        if !columns.contains(&key) {
+            let base = solidcraft_ui_text::format("config.add_suppress_folder", &[("name", &group.name)]);
+            let duplicate = app.session.doc.timeline_groups.iter().filter(|other| other.name == group.name).count() > 1;
+            let label = if duplicate { format!("{base} (#{})", group.id) } else { base };
+            options.push((label, json!({ "folder": group.id })));
+        }
+    }
     for body in &app.session.model.state().bodies {
         for kind in ["material", "appearance"] {
             if !columns.contains(&format!("{kind}:{}", body.name)) {
@@ -536,65 +582,79 @@ fn column_menu(
         // again would be clipped to that small height, so a list that scrolls takes the full one.
         let list_height = solidcraft_theme::Tokens::get().space_24 * 12.0;
         egui::ScrollArea::vertical().max_height(list_height).min_scrolled_height(list_height).show(ui, |ui| {
-            for (label, p) in &matching {
-                if ui_kit::button(ui, label.as_str(), ui_kit::Button::Normal).clicked() {
-                    pick = Some(p.clone());
-                    ui.close();
-                }
+            let choices: Vec<_> = matching
+                .iter()
+                .enumerate()
+                .map(|(index, (label, params))| ui_kit::Item::action(&format!("column:{index}"), label, "").with(params.clone()))
+                .collect();
+            let output = ui_kit::Menu::items(ui, ui.make_persistent_id("config_column_choices"), &choices, !was_open);
+            if let Some(picked) = output.picked {
+                pick = picked.params;
+            }
+            if output.close {
+                ui.close();
             }
             if !faces {
                 return;
             }
-            ui_kit::action_menu(ui, "Face Appearance", |ui| {
-                ui_kit::text(
-                    ui,
-                    solidcraft_ui_text::tr_label("Semantic faces share their appearance across instances."),
-                    ui_kit::Text::Note("semantic_faces"),
-                );
+            let face_button = ui_kit::text_button(ui, "Face Appearance", true);
+            let bodies = if face_button.clicked() || ui_kit::Menu::response_is_open(&face_button) {
                 let state = app.session.model.state();
+                let mut bodies = Vec::new();
                 for body in &state.bodies {
                     if body.body.is_mesh() {
                         continue;
                     }
-                    ui_kit::action_menu(ui, &format!("Faces on {}", body.name), |ui| {
-                        // Measured once per body, at the same tolerance: this menu is drawn again
-                        // every frame while it is open, and measuring meshes the whole body.
-                        if let Ok(faces) = body.joint_faces() {
-                            let mut seen = std::collections::BTreeSet::new();
-                            let mesh = body.mesh();
-                            let mut points = std::collections::BTreeMap::new();
-                            for (triangle, index) in mesh.triangles.iter().zip(&mesh.tri_face) {
-                                if let std::collections::btree_map::Entry::Vacant(entry) = points.entry(*index as usize)
-                                    && let Some([a, b, c]) = mesh.tri(triangle)
-                                {
-                                    entry.insert((a + b + c) * (1. / 3.));
-                                }
-                            }
-                            for face in faces.iter() {
-                                // A curved face centroid can lie on another surface.
-                                // Pick an interior triangle point on this actual face.
-                                let Some(point) = points.get(&face.index).copied() else { continue };
-                                let Ok(target) = app.session.doc.configuration_face_target(body, face.index, point) else { continue };
-                                let supported = if target.certificate.is_some() {
-                                    // Capture read this exact face's current source certificate.
-                                    // Enumerate its pieces once in the command, not per menu face.
-                                    app.session.doc.certify_config_face(&target).is_ok()
-                                } else {
-                                    app.session.doc.configuration_face_indices(body, &target).is_ok()
-                                };
-                                if !supported || !seen.insert(target.name.clone()) {
-                                    continue;
-                                }
-                                let Some((_, role)) = solidcraft_engine::doc::persistent_name::split_feature(&target.name) else { continue };
-                                if ui_kit::button(ui, role, ui_kit::Button::Normal).clicked() {
-                                    pick = Some(json!({"face_appearance":{"target":target}}));
-                                    ui.close();
-                                }
+                    let body_id = format!("faces:{}", body.name);
+                    let mut face_items = Vec::new();
+                    if ui_kit::Menu::branch_open(ui.ctx(), face_button.id.with("shared_menu"), &body_id)
+                        && let Ok(faces) = body.joint_faces()
+                    {
+                        let mut seen = std::collections::BTreeSet::new();
+                        let mesh = body.mesh();
+                        let mut points = std::collections::BTreeMap::new();
+                        for (triangle, index) in mesh.triangles.iter().zip(&mesh.tri_face) {
+                            if let std::collections::btree_map::Entry::Vacant(entry) = points.entry(*index as usize)
+                                && let Some([a, b, c]) = mesh.tri(triangle)
+                            {
+                                entry.insert((a + b + c) * (1. / 3.));
                             }
                         }
-                    });
+                        for face in faces.iter() {
+                            // A curved face centroid can lie on another surface.
+                            // Pick an interior triangle point on this actual face.
+                            let Some(point) = points.get(&face.index).copied() else { continue };
+                            let Ok(target) = app.session.doc.configuration_face_target(body, face.index, point) else { continue };
+                            let supported = if target.certificate.is_some() {
+                                // Capture read this exact face's current source certificate.
+                                // Enumerate its pieces once in the command, not per menu face.
+                                app.session.doc.certify_config_face(&target).is_ok()
+                            } else {
+                                app.session.doc.configuration_face_indices(body, &target).is_ok()
+                            };
+                            if !supported || !seen.insert(target.name.clone()) {
+                                continue;
+                            }
+                            let Some((_, role)) = solidcraft_engine::doc::persistent_name::split_feature(&target.name) else { continue };
+                            face_items.push(
+                                ui_kit::Item::action(&format!("face:{}:{}", body.name, face.index), role, "")
+                                    .with(json!({"face_appearance":{"target":target}})),
+                            );
+                        }
+                    }
+                    let mut entry = ui_kit::Item::lazy_submenu(&body_id, &format!("Faces on {}", body.name), "");
+                    entry.children = face_items;
+                    entry.tip = Some(solidcraft_ui_text::tr_label("Semantic faces share their appearance across instances.").to_string());
+                    bodies.push(entry);
                 }
-            });
+                bodies
+            } else {
+                Vec::new()
+            };
+            if let Some(picked) = ui_kit::Menu::button_items(&face_button, &bodies) {
+                pick = picked.params;
+                ui.close();
+            }
         });
     });
     rule_editor.column_menu_open = shown.is_some();
@@ -612,6 +672,8 @@ fn column_menu(
                     json!({ "features": [n] })
                 } else if let Some(n) = p.get("joint") {
                     json!({ "joints": [n] })
+                } else if let Some(n) = p.get("folder") {
+                    json!({ "folders": [n] })
                 } else if let Some(n) = p.get("material") {
                     json!({ "materials": [n] })
                 } else if let Some(n) = p.get("component_appearance") {
@@ -770,7 +832,7 @@ fn value_cell(
     };
     let tab_target = [ui_kit::CellKey::Next, ui_kit::CellKey::Previous].into_iter().any(|key| goes(key).is_some());
     let (kind, _) = column_parts(column);
-    if matches!(kind, "suppress" | "suppress_joint") {
+    if matches!(kind, "suppress" | "suppress_joint" | "suppress_folder") {
         let (response, toggled) = suppress_box(ui, column, value);
         crate::scenario::publish_handle(&format!("config:cell:{name}:{column}"), response.rect.center());
         if let Some(on) = toggled {

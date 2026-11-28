@@ -2017,7 +2017,7 @@ mod tests {
         let a = sketch.add_point(solidcore_record::Vec2::ZERO, None).unwrap();
         let b = sketch.add_point(solidcore_record::Vec2::new(30.0, 0.0), None).unwrap();
         let line = sketch.add_line_pts(a, b, None).unwrap();
-        let dimension = doc.new_model_param("qqlb * 3", "mm");
+        let dimension = doc.new_model_param("qqlb * 3", "mm").unwrap();
         sketch.add_constraint(solidcraft_sketch::ConstraintKind::Length { l: line, value: 30.0 }, Some(dimension.clone())).unwrap();
         doc.add_feature(crate::FeatureKind::Sketch { plane: crate::PlaneRef::Origin { name: "XY".into() }, sketch }, None).unwrap();
         doc.rename_param(&dimension, "qqml").unwrap();
@@ -2161,6 +2161,7 @@ mod tests {
             height_from: None,
             bend_relief_shape: None,
             corners: Vec::new(),
+            offset: None,
         };
         let saved = |document: &Document| -> Value { serde_json::from_str(&document.to_json()).unwrap() };
         // A flange that follows the rule saves neither key, and a design of format 23 opens as it was.
@@ -2371,7 +2372,9 @@ mod tests {
                         symmetric_offset: false,
                         through_all: false,
                         second_follows_first: false,
+                        through_all_to_corner: false,
                         taper: Some("0 deg".into()),
+                        taper2: None,
                         corner: Default::default(),
                         to: Some(crate::FacePick(solidcore_record::Vec3::new(0.0, 0.0, 10.0))),
                         to_offset: Some("offset + 1 mm".into()),
@@ -2385,6 +2388,7 @@ mod tests {
                         one_sided_direction: None,
                         to_ref: None,
                         from_ref: None,
+                        extend_to_face: false,
                     },
                     operation: Operation::NewBody,
                     targets: vec![],
@@ -2769,12 +2773,43 @@ mod tests {
     }
 
     #[test]
+    fn configuration_folder_suppression_roundtrips() {
+        use crate::config::{Column, ConfigRow};
+        let mut d = Document::new("folder suppression");
+        let feature = d
+            .add_feature(
+                crate::FeatureKind::Box {
+                    corner: ["0".into(), "0".into(), "0".into()],
+                    length: "10".into(),
+                    width: "10".into(),
+                    height: "10".into(),
+                    operation: crate::Operation::NewBody,
+                    centred: false,
+                },
+                Some("Box1"),
+            )
+            .unwrap();
+        let group = d.allocate_id().unwrap();
+        d.timeline_groups.push(crate::TimelineGroup { id: group, name: "Details".into(), parent: None, features: vec![feature], joints: Vec::new() });
+        d.configs.columns = vec![Column::SuppressFolder(group)];
+        d.configs.rows = vec![
+            ConfigRow { id: d.allocate_id().unwrap(), name: "On".into(), cells: vec!["false".into()] },
+            ConfigRow { id: d.allocate_id().unwrap(), name: "Off".into(), cells: vec!["true".into()] },
+        ];
+        d.apply_configuration("Off").unwrap();
+        let opened = read(&d.to_json()).unwrap();
+        assert_eq!(opened, d);
+        assert!(opened.feature(feature).unwrap().suppressed);
+        assert!(opened.configuration_matches());
+    }
+
+    #[test]
     fn version_seven_origin_sketch_keeps_geometry_dimension_ids_and_expressions() {
         use solidcore_record::Vec2;
         use solidcraft_sketch::{ConstraintKind, Sketch};
         let mut d = Document::new("legacy origin dimensions");
         d.set_param("reach", "25 mm", Some("mm"), None).unwrap();
-        let dim = d.new_model_param("reach", "mm");
+        let dim = d.new_model_param("reach", "mm").unwrap();
         let mut sketch = Sketch::new();
         let end = sketch.add_point(Vec2::new(25.0, 0.0), Some("tip")).unwrap();
         let line = sketch.add_line_pts(0, end, Some("edge")).unwrap();
@@ -2804,9 +2839,9 @@ mod tests {
         use solidcore_record::Vec2;
         use solidcraft_sketch::{ConstraintKind, Sketch};
         let mut d = Document::new("persistent typed dimensions");
-        let heading = d.new_model_param("45 deg", "deg");
-        let sweep = d.new_model_param("180 deg", "deg");
-        let overall = d.new_model_param("10 mm", "mm");
+        let heading = d.new_model_param("45 deg", "deg").unwrap();
+        let sweep = d.new_model_param("180 deg", "deg").unwrap();
+        let overall = d.new_model_param("10 mm", "mm").unwrap();
         let mut sketch = Sketch::new();
         let end = sketch.add_point(Vec2::new(2.0, 2.0), None).unwrap();
         let line = sketch.add_line_pts(0, end, None).unwrap();
