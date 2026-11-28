@@ -40,7 +40,6 @@ use solidcraft_theme::Tokens;
 pub const HOLD_SECS: f64 = 0.5;
 /// How far (screen points) a repeat click may be from the last one and still cycle.
 const CYCLE_SLOP: f32 = 4.0;
-const ROW_HEIGHT: f32 = 24.0;
 /// Indentation per nesting level in the tree view.
 const INDENT_STEP: f32 = 14.0;
 /// Popup width when category filter chips or tree nesting are shown.
@@ -928,6 +927,14 @@ pub(crate) fn hovered_occurrence(app: &SolveApp) -> Option<&[u64]> {
     }
 }
 
+/// The face to show through the model while the user considers its row.
+pub(crate) fn hovered_face(app: &SolveApp) -> Option<(&str, usize)> {
+    let popup = active_popup(app).filter(|p| p.include_hidden)?;
+    match &popup.rows.get(popup.hovered?)?.sel {
+        Sel::Face { body, index, .. } => Some((body, *index)),
+        _ => None,
+    }
+}
 /// While the list is open, the hovered row is what the viewport lights up.
 pub fn hover_override(app: &mut SolveApp) {
     let Some(popup) = active_popup(app) else { return };
@@ -1296,9 +1303,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let w = (width - margins.x).max(0.0);
     let (chip_rects, filter_bar_h) = layout_chips(ctx, w, &chip_font, t.text, &chips);
     let header = 22.0;
+    let row_height = t.control_height + t.space_2;
     let gap = vec2(12.0, 12.0);
     let at = pos2(p.at.x.clamp(screen.left(), screen.right()), p.at.y.clamp(screen.top(), screen.bottom()));
-    let rows_height = display_rows.len() as f32 * ROW_HEIGHT;
+    let rows_height = display_rows.len() as f32 * row_height;
     let overhead = header + filter_bar_h + margins.y;
     let scroll_height = (screen.height() - overhead).max(0.0);
     let size = vec2(width, overhead + rows_height.min(scroll_height));
@@ -1356,9 +1364,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     for drow in &display_rows {
                         match drow {
                             DisplayRow::Group { key, name, icon, depth, count, collapsed, occurrence_path } => {
-                                let (r, row_resp) = ui.allocate_exact_size(vec2(w, ROW_HEIGHT), Sense::hover());
+                                let (r, row_resp) = ui.allocate_exact_size(vec2(w, row_height), Sense::hover());
                                 let base_x = tree_row_base_x(r, *depth);
-                                let chev_rect = Rect::from_min_size(pos2(base_x, r.top()), vec2(16.0, ROW_HEIGHT));
+                                let chev_rect = Rect::from_min_size(pos2(base_x, r.top()), vec2(16.0, row_height));
                                 let chev_resp = ui.interact(chev_rect, ui.scope_id().with(("select_other_group_chev", key)), Sense::click());
                                 crate::scenario::publish_handle(&format!("select_other:toggle:{key}"), chev_rect.center());
                                 let mut toggle_clicked = false;
@@ -1414,12 +1422,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                 }
                             }
                             DisplayRow::Item { row_idx, label, tooltip, icon, depth, toggle } => {
-                                let (r, row_resp) = ui.allocate_exact_size(vec2(w, ROW_HEIGHT), Sense::hover());
+                                let (r, row_resp) = ui.allocate_exact_size(vec2(w, row_height), Sense::hover());
                                 let (icon_cx, text_left, toggle_clicked) = if show_tree {
                                     let base_x = tree_row_base_x(r, *depth);
                                     let mut tclick = false;
                                     if let Some((key, collapsed, _)) = toggle {
-                                        let chev_rect = Rect::from_min_size(pos2(base_x, r.top()), vec2(16.0, ROW_HEIGHT));
+                                        let chev_rect = Rect::from_min_size(pos2(base_x, r.top()), vec2(16.0, row_height));
                                         let chev_resp = ui.interact(chev_rect, ui.scope_id().with(("select_other_chev", key)), Sense::click());
                                         crate::scenario::publish_handle(&format!("select_other:toggle:{key}"), chev_rect.center());
                                         crate::ui_kit::disclosure(
